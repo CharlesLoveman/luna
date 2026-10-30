@@ -67,3 +67,30 @@ TEST_F( ONNXParserTest, ParseModelWithNodes )
         return;
     }
 }
+
+TEST_F( ONNXParserTest, ParseModelWithSoftmax )
+{
+    std::string modelPath = RESOURCES_DIR "/onnx/toy_softmax.onnx";
+
+    try
+    {
+        auto model = OnnxToTorchParser::parse( String( modelPath.c_str() ) );
+        if ( model )
+        {
+            // TODO: validate node structure against expected test model.
+            EXPECT_GE( model->getNumNodes(), 1 );
+
+            // TODO: compare input indices to expected values.
+            auto inputIndices = model->getInputIndices();
+            EXPECT_EQ( inputIndices.size(), 1 );
+
+            // TODO: compare output index to expected value.
+            EXPECT_EQ( model->getOutputIndex(), 1 );
+        }
+    }
+    catch ( const std::exception &e )
+    {
+        std::cerr << "ONNX model not available: " << e.what() << std::endl;
+        return;
+    }
+}

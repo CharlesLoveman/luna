@@ -148,6 +148,10 @@ convertSigmoid( const luna_onnx::NodeProto &node,
                 const Map<String, luna_onnx::ValueInfoProto> &name_to_input,
                 const Map<String, luna_onnx::TensorProto> &name_to_initializer );
 std::shared_ptr<NLR::BoundedTorchNode>
+convertSoftmax( const luna_onnx::NodeProto &node,
+                const Map<String, luna_onnx::ValueInfoProto> &name_to_input,
+                const Map<String, luna_onnx::TensorProto> &name_to_initializer );
+std::shared_ptr<NLR::BoundedTorchNode>
 convertIdentity( const luna_onnx::NodeProto &node,
                  const Map<String, luna_onnx::ValueInfoProto> &name_to_input,
                  const Map<String, luna_onnx::TensorProto> &name_to_initializer );

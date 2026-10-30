@@ -26,6 +26,7 @@
 #include "../engine/nodes/BoundedConcatNode.h"
 #include "../engine/nodes/BoundedSliceNode.h"
 #include "../engine/LunaError.h"
+#include "BoundedSoftmaxNode.h"
 #include "File.h"
 #include "MString.h"
 #include "Vector.h"
@@ -35,6 +36,7 @@
 #include <memory>
 #include <cstdlib>
 #include <cstdio>
+#include <torch/nn/options/activation.h>
 #include <torch/torch.h>
 #include <onnx.proto3.pb.h>
 
@@ -893,6 +895,11 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph()
                 else if ( node.op_type() == "Sigmoid" || node.op_type() == "sigmoid" )
                 {
                     boundedNode = BoundedOperationConverter::convertSigmoid( node, name_to_input,
+                                                                             name_to_initializer );
+                }
+                else if ( node.op_type() == "Softmax" || node.op_type() == "softmax" )
+                {
+                    boundedNode = BoundedOperationConverter::convertSoftmax( node, name_to_input,
                                                                              name_to_initializer );
                 }
                 else if ( node.op_type() == "Reshape" )
@@ -2039,6 +2046,34 @@ convertSigmoid( const luna_onnx::NodeProto &node,
 
     auto sigmoid_module = torch::nn::Sigmoid();
     auto boundedNode = std::make_shared<NLR::BoundedSigmoidNode>( sigmoid_module );
+
+    if ( inputSize > 0 )
+    {
+        boundedNode->setInputSize( inputSize );
+        boundedNode->setOutputSize( inputSize );
+    }
+
+    return boundedNode;
+}
+
+std::shared_ptr<NLR::BoundedTorchNode>
+convertSoftmax( const luna_onnx::NodeProto &node,
+                const Map<String, luna_onnx::ValueInfoProto> &name_to_input,
+                const Map<String, luna_onnx::TensorProto> &name_to_initializer )
+{
+    int axis = AttributeUtils::getIntAttribute( node, "axis", -1 );
+
+    unsigned inputSize = 0;
+    if ( node.input_size() > 0 )
+    {
+        String inputName = node.input( 0 );
+        TensorShape inputShape =
+            extractShapeFromNode( node, name_to_input, name_to_initializer, inputName );
+        inputSize = computeTensorSize( inputShape );
+    }
+
+    auto softmax_module = torch::nn::Softmax( torch::nn::SoftmaxOptions( axis ) );
+    auto boundedNode = std::make_shared<NLR::BoundedSoftmaxNode>( softmax_module );
 
     if ( inputSize > 0 )
     {
