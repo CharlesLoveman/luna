@@ -18,6 +18,7 @@ target_sources(${LUNA_LIB} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedReLUNode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedReshapeNode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedSigmoidNode.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedSoftmaxNode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedSliceNode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nodes/BoundedSubNode.cpp
 )

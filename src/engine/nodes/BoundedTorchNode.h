@@ -51,7 +51,8 @@ enum class NodeType
     SIGMOID,
     CONVTRANSPOSE,
     CONCAT,
-    SLICE
+    SLICE,
+    SOFTMAX
 };
 
 class BoundedTorchNode : public torch::nn::Module
