@@ -93,7 +93,7 @@ typedef std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> JacobianComp;
 std::tuple<JacobianComp, torch::Tensor>
 softmax_lse_lower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
 {
-    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) );
+    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) )[0];
     const torch::Tensor u_s = ub_p - max_u;
     const torch::Tensor l_s = lb_p - max_u;
     const torch::Tensor x0_s = x0_p - max_u;
@@ -118,7 +118,7 @@ softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
                    const torch::Tensor &sm_x0, const torch::Tensor &max_x0,
                    const torch::Tensor &sum_exp_x0 )
 {
-    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) );
+    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) )[0];
     const torch::Tensor u_s = ub_p - max_u;
     const torch::Tensor l_s = lb_p - max_u;
     const torch::Tensor exp_u = torch::exp( u_s );
@@ -178,7 +178,7 @@ BoundA propagate( const BoundA &last_A,
     const torch::Tensor A_neg = A_p.clamp( {}, 0.0 );
 
     const torch::Tensor next_A_pos = apply_jacobian_components( A_pos, J_pos_comp );
-    const torch::Tensor next_A_neg = apply_jacobian_components( A_pos, J_neg_comp );
+    const torch::Tensor next_A_neg = apply_jacobian_components( A_neg, J_neg_comp );
 
     const BoundA next_A = BoundA( restore_dim( next_A_pos + next_A_neg, A_dim, dim, ndim ) );
 
@@ -198,7 +198,6 @@ void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &las
 {
     const torch::Tensor &lb = inputBounds[0].lower();
     const torch::Tensor &ub = inputBounds[0].upper();
-    // require_finite_relaxation_bounds(lb, ub, 'softmax')
 
     const int64_t ndim = lb.ndimension();
     const int64_t axis = _softmaxModule->ptr()->options.dim();
@@ -210,7 +209,7 @@ void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &las
 
     const torch::Tensor x0_p = ( lb_p + ub_p ) / 2.0;
 
-    const torch::Tensor max_x0 = std::get<0>( x0_p.max( -1, true ) );
+    const torch::Tensor max_x0 = std::get<0>( x0_p.max( -1, true ) )[0];
     const torch::Tensor x0_shifted = x0_p - max_x0;
     const torch::Tensor exp_x0 = torch::exp( x0_shifted );
     const torch::Tensor sum_exp_x0 = exp_x0.sum( -1, true );
@@ -247,6 +246,7 @@ BoundedTensor<torch::Tensor> BoundedSoftmaxNode::computeIntervalBoundPropagation
         finite_inputs, torch::nan_to_num( lower, 0.0, 0.0, 0.0 ), torch::zeros_like( lower ) );
     const torch::Tensor upper_finite = torch::where(
         finite_inputs, torch::nan_to_num( upper, 1.0, 1.0, 1.0 ), torch::ones_like( upper ) );
-    return BoundedTensor<torch::Tensor>( lower_finite, upper_finite );
+    return BoundedTensor<torch::Tensor>( lower_finite.clamp( 0.0, 1.0 ),
+                                         upper_finite.clamp( 0.0, 1.0 ) );
 }
 } // namespace NLR
