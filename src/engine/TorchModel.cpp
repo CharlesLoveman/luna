@@ -613,6 +613,7 @@ torch::Tensor TorchModel::forward( unsigned nodeIndex, Map<unsigned, torch::Tens
     case NodeType::CONCAT:
     case NodeType::CONVTRANSPOSE:
     case NodeType::SLICE:
+    case NodeType::SOFTMAX:
     {
         if ( !_dependencies.exists( nodeIndex ) )
         {

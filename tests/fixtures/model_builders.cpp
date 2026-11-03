@@ -1,5 +1,7 @@
 #include "model_builders.h"
+#include "BoundedSoftmaxNode.h"
 #include "src/input_parsers/OnnxToTorch.h"
+#include <torch/nn/modules/activation.h>
 #include <torch/torch.h>
 #include <random>
 
@@ -293,6 +295,25 @@ ModelBuilder &ModelBuilder::addReshape( const std::vector<int64_t> &shape, const
         reshapeNode->setNodeName( String( name.c_str() ) );
     }
     _nodes.push_back( reshapeNode );
+
+    if ( !_nodes.empty() && _nodes.size() > 1 )
+    {
+        addDependency( nodeIndex, nodeIndex - 1 );
+    }
+    return *this;
+}
+
+ModelBuilder &ModelBuilder::addSoftmax( const std::string &name, const int64_t dim )
+{
+    torch::nn::Softmax softmax_module{ dim };
+    auto softmaxNode = std::make_shared<NLR::BoundedSoftmaxNode>( softmax_module );
+    unsigned nodeIndex = getNextNodeIndex();
+    softmaxNode->setNodeIndex( nodeIndex );
+    if ( !name.empty() )
+    {
+        softmaxNode->setNodeName( String( name.c_str() ) );
+    }
+    _nodes.push_back( softmaxNode );
 
     if ( !_nodes.empty() && _nodes.size() > 1 )
     {

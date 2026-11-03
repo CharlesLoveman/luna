@@ -61,6 +61,7 @@ public:
     ModelBuilder &addSigmoid( const std::string &name = "" );
     ModelBuilder &addFlatten( const std::string &name = "" );
     ModelBuilder &addReshape( const std::vector<int64_t> &shape, const std::string &name = "" );
+    ModelBuilder &addSoftmax( const std::string &name = "", const int64_t dim = -1 );
 
     std::shared_ptr<NLR::TorchModel> build();
 
