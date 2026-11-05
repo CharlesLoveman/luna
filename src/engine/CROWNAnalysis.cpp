@@ -41,28 +41,8 @@ torch::Tensor CROWNAnalysis::buildCenterInputForForward() const
     ub = ub.to( torch::kFloat32 );
     torch::Tensor center = ( lb + ub ) / 2.0;
 
-    // ONNX models expect image tensors; VNN-LIB bounds are flat
-    if ( center.numel() == 9408 )
-    {
-        center = center.view( { 1, 3, 56, 56 } );
-    }
-    else if ( center.numel() == 12288 )
-    {
-        center = center.view( { 1, 3, 64, 64 } );
-    }
-    else if ( center.numel() == 3072 )
-    {
-        center = center.view( { 1, 3, 32, 32 } );
-    }
-    else if ( center.numel() == 784 )
-    {
-        center = center.view( { 1, 1, 28, 28 } );
-    }
-    else
-    {
-        center = center.view( { 1, (long)center.numel() } );
-    }
-    return center;
+    // VNN-LIB bounds are flat, the model knows its own sample shape
+    return _torchModel->toBatchedInput( center );
 }
 
 void CROWNAnalysis::ensureCenterActivations()
@@ -1025,11 +1005,9 @@ void CROWNAnalysis::concretizeNode( unsigned startIndex, const Vector<unsigned> 
         inputLower = torch::zeros( { (long)inputSize }, options );
         inputUpper = torch::ones( { (long)inputSize }, options );
     }
-    // Flatten so batched or NCHW-shaped inputs concretize like flat vectors -
-    // ensure3x lifts a 1-D tensor to [1, n, 1] for the bmm and the patches
-    // path reshapes to its own input_shape either way
-    inputLower = inputLower.to( torch::kFloat32 ).flatten();
-    inputUpper = inputUpper.to( torch::kFloat32 ).flatten();
+    // Keep the lane dimension, the contraction reads one box row per lane
+    inputLower = _torchModel->toBatchedInput( inputLower.to( torch::kFloat32 ) ).flatten( 1 );
+    inputUpper = _torchModel->toBatchedInput( inputUpper.to( torch::kFloat32 ) ).flatten( 1 );
 
     log( Stringf( "concretizeNode() - Checking for A matrices at input node %d", inputIndex ) );
     log( Stringf( "concretizeNode() - _lA.exists(%d)=%d, _uA.exists(%d)=%d", inputIndex,
@@ -1089,7 +1067,9 @@ void CROWNAnalysis::concretizeNode( unsigned startIndex, const Vector<unsigned> 
                     "CROWNAnalysis::concretizeNode - Patches without input_shape" );
             }
 
-            const auto &in_shape = patches_ptr->input_shape;
+            // input_shape is one sample behind a leading batch of 1, the box has a row per lane
+            std::vector<int64_t> in_shape = patches_ptr->input_shape;
+            in_shape[0] = inputLower.size( 0 );
             torch::Tensor xL_img = inputLower.reshape( in_shape ).to( torch::kFloat32 );
             torch::Tensor xU_img = inputUpper.reshape( in_shape ).to( torch::kFloat32 );
 
@@ -1130,7 +1110,7 @@ void CROWNAnalysis::concretizeNode( unsigned startIndex, const Vector<unsigned> 
                 bound = bound + b;
             }
 
-            return bound.squeeze( 0 );
+            return bound;
         };
 
         if ( lPatches )
@@ -1158,25 +1138,6 @@ void CROWNAnalysis::concretizeNode( unsigned startIndex, const Vector<unsigned> 
         torch::Tensor lA = lA_bound.asTensor();
         torch::Tensor uA = uA_bound.asTensor();
 
-        if ( lA.defined() && lA.dim() >= 2 )
-        {
-            // Compare total input elements, not dim 0 - a batched input like
-            // [1, n] has size(0) == 1, which spuriously routed every
-            // intermediate node to the IBP fallback even though ensure3x
-            // already normalizes such inputs for the bmm below
-            int nodeDim = static_cast<int>( inputLower.numel() );
-            int expectedNodeDim =
-                lA.dim() > 3 ? static_cast<int>( lA.flatten( 2 ).size( -1 ) ) : lA.size( -1 );
-
-            if ( nodeDim != expectedNodeDim )
-            {
-                throw std::runtime_error(
-                    "CROWNAnalysis::concretizeNode - input/A feature mismatch: node=" +
-                    std::to_string( startIndex ) + " input=" + std::to_string( nodeDim ) +
-                    " expected=" + std::to_string( expectedNodeDim ) );
-            }
-        }
-
         computeConcreteBounds( lA, uA, lBias, uBias, inputLower, inputUpper, concreteLower,
                                concreteUpper );
     }
@@ -1203,31 +1164,38 @@ void CROWNAnalysis::concretizeNode( unsigned startIndex, const Vector<unsigned> 
                         std::vector<int64_t>( unstableIndices.begin(), unstableIndices.end() ),
                         indexOptions );
 
-                    auto originalShape = fullLower.sizes();
-                    torch::Tensor fullLowerFlat = fullLower.flatten();
-                    torch::Tensor fullUpperFlat = fullUpper.flatten();
+                    const auto originalShape = fullLower.sizes().vec();
+                    const int64_t lanes = inputLower.size( 0 );
+                    torch::Tensor fullLowerRows = fullLower.reshape( { lanes, -1 } );
+                    torch::Tensor fullUpperRows = fullUpper.reshape( { lanes, -1 } );
 
-                    torch::Tensor concreteLowerFlat = concreteLower.flatten();
-                    torch::Tensor concreteUpperFlat = concreteUpper.flatten();
+                    // Each lane writes its own row at the shared unstable columns
+                    torch::Tensor concreteLowerRows = concreteLower.reshape( { lanes, -1 } );
+                    torch::Tensor concreteUpperRows = concreteUpper.reshape( { lanes, -1 } );
 
                     // Preserve gradients for alpha-CROWN; detach otherwise
                     bool retainSparseGrad = ( LunaConfiguration::ANALYSIS_METHOD ==
                                               LunaConfiguration::AnalysisMethod::AlphaCROWN );
-                    if ( retainSparseGrad )
+                    if ( !retainSparseGrad )
                     {
-                        fullLowerFlat = fullLowerFlat.index_put( { indices }, concreteLowerFlat );
-                        fullUpperFlat = fullUpperFlat.index_put( { indices }, concreteUpperFlat );
+                        concreteLowerRows = concreteLowerRows.detach();
+                        concreteUpperRows = concreteUpperRows.detach();
                     }
-                    else
-                    {
-                        fullLowerFlat =
-                            fullLowerFlat.index_put( { indices }, concreteLowerFlat.detach() );
-                        fullUpperFlat =
-                            fullUpperFlat.index_put( { indices }, concreteUpperFlat.detach() );
-                    }
+                    // A neuron stable in this lane keeps its IBP bound, as in a single call, the
+                    // shared set only holds it because another lane has it unstable
+                    const auto ibpLowerAtSet = fullLowerRows.index_select( 1, indices );
+                    const auto ibpUpperAtSet = fullUpperRows.index_select( 1, indices );
+                    const auto unstableInLane = ( ibpLowerAtSet < 0 ) & ( ibpUpperAtSet > 0 );
+                    concreteLowerRows =
+                        torch::where( unstableInLane, concreteLowerRows, ibpLowerAtSet );
+                    concreteUpperRows =
+                        torch::where( unstableInLane, concreteUpperRows, ibpUpperAtSet );
 
-                    concreteLower = fullLowerFlat.reshape( originalShape );
-                    concreteUpper = fullUpperFlat.reshape( originalShape );
+                    fullLowerRows = fullLowerRows.index_copy( 1, indices, concreteLowerRows );
+                    fullUpperRows = fullUpperRows.index_copy( 1, indices, concreteUpperRows );
+
+                    concreteLower = fullLowerRows.reshape( originalShape );
+                    concreteUpper = fullUpperRows.reshape( originalShape );
                 }
                 else
                 {
@@ -1487,97 +1455,82 @@ Vector<BoundedTensor<torch::Tensor>> CROWNAnalysis::getInputBoundsForNode( unsig
     return inputBounds;
 }
 
-// A matrices use [spec, batch, features]; ensure3A converts to [batch, spec, features] for bmm
-static inline torch::Tensor ensure3A( const torch::Tensor &A )
+namespace
 {
-    if ( !A.defined() )
+
+/// A is (spec, batch, *features) and a 2-D A is one lane (spec, features).
+torch::Tensor concretizationA( const torch::Tensor &A )
+{
+    if ( A.dim() > 3 )
+        return A.flatten( 2 );
+    if ( A.dim() == 3 )
         return A;
-    torch::Tensor normalizedA = A.dim() > 3 ? A.flatten( 2 ) : A;
-    if ( normalizedA.dim() == 3 )
-    {
-        if ( normalizedA.size( 0 ) > 1 && normalizedA.size( 1 ) > 1 )
-        {
-            throw std::runtime_error(
-                "CROWNAnalysis concretization does not support batch > 1 with spec > 1" );
-        }
-        torch::Tensor result;
-        if ( normalizedA.size( 1 ) == 1 && normalizedA.size( 0 ) > 1 )
-        {
-            result = normalizedA.transpose( 0, 1 );
-        }
-        else if ( normalizedA.size( 0 ) == 1 )
-        {
-            result = normalizedA;
-        }
-        else
-        {
-            torch::Tensor transposed = normalizedA.transpose( 0, 1 );
-            if ( transposed.size( 0 ) > 1 )
-            {
-                result = transposed.narrow( 0, 0, 1 );
-            }
-            else
-            {
-                result = transposed;
-            }
-        }
-        return result;
-    }
-    if ( normalizedA.dim() == 2 )
-        return normalizedA.unsqueeze( 0 );
-    if ( normalizedA.dim() == 1 )
-        return normalizedA.unsqueeze( 0 ).unsqueeze( 0 );
-    return normalizedA.unsqueeze( 0 );
+    if ( A.dim() == 2 )
+        return A.unsqueeze( 1 );
+    throw std::runtime_error( "CROWNAnalysis concretization needs A of rank 2 or more" );
 }
-static inline torch::Tensor ensure3x( const torch::Tensor &x )
+
+/// The box is one row of features per lane, or one row shared by every lane.
+torch::Tensor concretizationX( const torch::Tensor &x, int64_t features )
 {
-    if ( !x.defined() )
-        return x;
-    if ( x.dim() == 1 )
+    if ( features <= 0 || x.numel() % features != 0 )
     {
-        return x.unsqueeze( 0 ).unsqueeze( -1 );
+        throw std::runtime_error( "CROWNAnalysis concretization: input has " +
+                                  std::to_string( x.numel() ) + " elements for " +
+                                  std::to_string( features ) + " features" );
     }
-    if ( x.dim() == 2 )
-    {
-        return x.unsqueeze( -1 );
-    }
-    if ( x.dim() == 3 )
-    {
-        return x.size( -1 ) == 1 ? x : x.flatten().unsqueeze( 0 ).unsqueeze( -1 );
-    }
-    return x.flatten( 1 ).unsqueeze( -1 );
+    return x.reshape( { -1, features } );
 }
-static inline torch::Tensor ensure3b( const torch::Tensor &b )
+
+/// Bias is (spec, batch), or a single column shared by every lane.
+torch::Tensor concretizationBias( const torch::Tensor &bias, int64_t spec )
 {
-    // bias is [spec, batch]; convert to [1, spec, 1] for bmm
-    if ( !b.defined() )
-        return b;
-    if ( b.dim() == 1 )
+    if ( !bias.defined() )
+        return torch::zeros( { spec, 1 }, torch::kFloat32 );
+    torch::Tensor shaped = bias.numel() == spec ? bias.reshape( { spec, 1 } ) : bias;
+    if ( shaped.dim() != 2 || shaped.size( 0 ) != spec )
     {
-        return b.unsqueeze( 0 ).unsqueeze( -1 );
+        throw std::runtime_error( "CROWNAnalysis concretization: bias does not match A" );
     }
-    if ( b.dim() == 2 )
-    {
-        if ( b.size( 1 ) > 1 )
-        {
-            throw std::runtime_error(
-                "CROWNAnalysis concretization does not support batched bias with batch > 1" );
-        }
-        else
-        {
-            return b.squeeze( 1 ).unsqueeze( 0 ).unsqueeze( -1 );
-        }
-    }
-    if ( b.dim() == 3 )
-    {
-        if ( b.size( 0 ) > 1 )
-        {
-            return b.narrow( 0, 0, 1 );
-        }
-        return b;
-    }
-    return b;
+    return shaped;
 }
+
+/// Every operand carries the lane count or 1, and the result has the larger of the two.
+int64_t commonLaneCount( int64_t aLanes, int64_t boxLanes, int64_t biasLanes )
+{
+    int64_t lanes = 1;
+    for ( const int64_t count : { aLanes, boxLanes, biasLanes } )
+    {
+        if ( count != 1 && lanes != 1 && count != lanes )
+        {
+            throw std::runtime_error( "CROWNAnalysis concretization: lane counts " +
+                                      std::to_string( aLanes ) + ", " + std::to_string( boxLanes ) +
+                                      " and " + std::to_string( biasLanes ) + " do not agree" );
+        }
+        lanes = std::max( lanes, count );
+    }
+    return lanes;
+}
+
+/// Sum over features of Apos * xPos + Aneg * xNeg, plus bias, as (batch, spec).
+torch::Tensor concretize( const torch::Tensor &lA, const torch::Tensor &bias,
+                          const torch::Tensor &xForPositive, const torch::Tensor &xForNegative )
+{
+    torch::Tensor A = concretizationA( lA.to( torch::kFloat32 ) );
+    const int64_t spec = A.size( 0 );
+    const int64_t features = A.size( 2 );
+    torch::Tensor xPos = concretizationX( xForPositive.to( torch::kFloat32 ), features );
+    torch::Tensor xNeg = concretizationX( xForNegative.to( torch::kFloat32 ), features );
+    torch::Tensor b = concretizationBias( bias.to( torch::kFloat32 ), spec );
+    (void)commonLaneCount( A.size( 1 ), xPos.size( 0 ), b.size( 1 ) );
+
+    // Lane b contracts its own A slice with its own box row, so lanes never mix
+    torch::Tensor term = torch::einsum( "sbf,bf->bs", { torch::clamp_min( A, 0 ), xPos } ) +
+                         torch::einsum( "sbf,bf->bs", { torch::clamp_max( A, 0 ), xNeg } );
+    return term + b.transpose( 0, 1 );
+}
+
+} // namespace
 
 torch::Tensor CROWNAnalysis::computeConcreteLowerBound( const torch::Tensor &lA,
                                                         const torch::Tensor &lBias,
@@ -1587,37 +1540,8 @@ torch::Tensor CROWNAnalysis::computeConcreteLowerBound( const torch::Tensor &lA,
     if ( !lA.defined() )
         return torch::Tensor();
 
-    torch::Tensor AL = ensure3A( lA.to( torch::kFloat32 ) );
-    torch::Tensor xL = ensure3x( xLower.to( torch::kFloat32 ) );
-    torch::Tensor xU = ensure3x( xUpper.to( torch::kFloat32 ) );
-    torch::Tensor bL = ensure3b( lBias.to( torch::kFloat32 ) );
-
-    if ( AL.dim() != 3 || xL.dim() != 3 || xU.dim() != 3 )
-    {
-        std::ostringstream oss;
-        oss << "CROWNAnalysis::computeConcreteLowerBound - Shape error: "
-            << "AL.dim()=" << AL.dim() << " xL.dim()=" << xL.dim() << " xU.dim()=" << xU.dim();
-        throw std::runtime_error( oss.str() );
-    }
-
-    torch::Tensor Apos = torch::clamp_min( AL, 0 );
-    torch::Tensor Aneg = torch::clamp_max( AL, 0 );
-
     // LB = bias + Apos * xL + Aneg * xU
-    if ( AL.size( 2 ) != xL.size( 1 ) )
-    {
-        std::ostringstream oss;
-        oss << "CROWNAnalysis::computeConcreteLowerBound - Feature dimension mismatch: "
-            << "AL.size(2)=" << AL.size( 2 ) << " (features) vs xL.size(1)=" << xL.size( 1 )
-            << " (input size)";
-        throw std::runtime_error( oss.str() );
-    }
-    torch::Tensor term = Apos.bmm( xL ) + Aneg.bmm( xU );
-    torch::Tensor out = term + bL;
-
-    torch::Tensor result = out.squeeze( -1 ).squeeze( 0 );
-
-    return result;
+    return concretize( lA, lBias, xLower, xUpper );
 }
 
 torch::Tensor CROWNAnalysis::computeConcreteUpperBound( const torch::Tensor &uA,
@@ -1628,21 +1552,8 @@ torch::Tensor CROWNAnalysis::computeConcreteUpperBound( const torch::Tensor &uA,
     if ( !uA.defined() )
         return torch::Tensor();
 
-    torch::Tensor AU = ensure3A( uA.to( torch::kFloat32 ) );
-    torch::Tensor xL = ensure3x( xLower.to( torch::kFloat32 ) );
-    torch::Tensor xU = ensure3x( xUpper.to( torch::kFloat32 ) );
-    torch::Tensor bU = ensure3b( uBias.to( torch::kFloat32 ) );
-
-    torch::Tensor Apos = torch::clamp_min( AU, 0 );
-    torch::Tensor Aneg = torch::clamp_max( AU, 0 );
-
     // UB = bias + Apos * xU + Aneg * xL
-    torch::Tensor term = Apos.bmm( xU ) + Aneg.bmm( xL );
-    torch::Tensor out = term + bU;
-
-    torch::Tensor result = out.squeeze( -1 ).squeeze( 0 );
-
-    return result;
+    return concretize( uA, uBias, xUpper, xLower );
 }
 
 void CROWNAnalysis::computeConcreteBounds( const torch::Tensor &lA, const torch::Tensor &uA,
@@ -2306,10 +2217,15 @@ void CROWNAnalysis::computeIntermediateBoundsLazy( unsigned nodeIndex )
 
     if ( _ibpBounds.exists( nodeIndex ) )
     {
-        torch::Tensor lb = _ibpBounds[nodeIndex].lower().flatten();
-        torch::Tensor ub = _ibpBounds[nodeIndex].upper().flatten();
+        const int64_t lanes =
+            _torchModel->hasInputBounds()
+                ? _torchModel->toBatchedInput( _torchModel->getInputLowerBounds() ).size( 0 )
+                : 1;
+        torch::Tensor lb = _ibpBounds[nodeIndex].lower().reshape( { lanes, -1 } );
+        torch::Tensor ub = _ibpBounds[nodeIndex].upper().reshape( { lanes, -1 } );
 
-        torch::Tensor unstableMask = ( lb < 0 ) & ( ub > 0 );
+        // One shared index set per layer, the union of every lane's unstable neurons
+        torch::Tensor unstableMask = ( ( lb < 0 ) & ( ub > 0 ) ).any( 0 );
 
         torch::Tensor indices = torch::nonzero( unstableMask ).flatten();
 
@@ -2325,7 +2241,7 @@ void CROWNAnalysis::computeIntermediateBoundsLazy( unsigned nodeIndex )
 
         log( Stringf(
             "computeIntermediateBoundsLazy() - Node %u has %u unstable neurons out of %lld total",
-            nodeIndex, unstableIndices.size(), (long long)lb.numel() ) );
+            nodeIndex, unstableIndices.size(), (long long)lb.size( 1 ) ) );
     }
 
     // No unstable neurons — skip backward CROWN to avoid memory blowup on conv layers

@@ -26,7 +26,11 @@ bool LunaConfiguration::COMPUTE_UPPER = true;
 bool LunaConfiguration::VERBOSE = false;
 
 unsigned LunaConfiguration::ALPHA_ITERATIONS = 20;
+unsigned LunaConfiguration::LAST_LOWER_ALPHA_ITERATIONS = 0;
+unsigned LunaConfiguration::LAST_UPPER_ALPHA_ITERATIONS = 0;
 float LunaConfiguration::ALPHA_LR = 0.5f;
+float LunaConfiguration::WARM_ALPHA_LR = 0.0f;
+unsigned LunaConfiguration::WARM_ALPHA_ITERATIONS = 0;
 float LunaConfiguration::ALPHA_LR_DECAY = 0.98f;
 bool LunaConfiguration::KEEP_BEST = true;
 bool LunaConfiguration::USE_SHARED_ALPHA = false;
@@ -131,6 +135,8 @@ void LunaConfiguration::resetToDefaults()
 
     ALPHA_ITERATIONS = 20;
     ALPHA_LR = 0.5f;
+    WARM_ALPHA_LR = 0.0f;
+    WARM_ALPHA_ITERATIONS = 0;
     ALPHA_LR_DECAY = 0.98f;
     KEEP_BEST = true;
     USE_SHARED_ALPHA = false;

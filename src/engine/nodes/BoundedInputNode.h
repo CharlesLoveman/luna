@@ -78,9 +78,26 @@ public:
     void setInputBounds( const BoundedTensor<torch::Tensor> &bounds );
     BoundedTensor<torch::Tensor> getInputBounds() const;
 
+    /// \brief Per-sample input shape without the batch dimension.
+    ///
+    /// Falls back to a flat shape of the input size when the builder never set one.
+    std::vector<int64_t> getSampleShape() const
+    {
+        if ( _sampleShape.empty() )
+        {
+            return { static_cast<int64_t>( _output_size ) };
+        }
+        return _sampleShape;
+    }
+    void setSampleShape( const std::vector<int64_t> &shape )
+    {
+        _sampleShape = shape;
+    }
+
 private:
     unsigned _inputIndex;
     BoundedTensor<torch::Tensor> _inputBounds;
+    std::vector<int64_t> _sampleShape;
 };
 
 } // namespace NLR

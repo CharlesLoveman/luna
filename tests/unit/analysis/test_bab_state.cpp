@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "src/engine/LunaError.h"
 #include "src/engine/TorchModel.h"
 #include "src/engine/CROWNAnalysis.h"
 #include "src/engine/AlphaCROWNAnalysis.h"
@@ -50,13 +51,14 @@ TEST_F( BaBStateTest, loadState_setsInputBounds )
     EXPECT_TRUE( torch::allclose( retrieved.upper(), inputBounds.upper() ) );
 }
 
-TEST_F( BaBStateTest, computeBoundsRejectsMultiBatchAtPublicBoundary )
+TEST_F( BaBStateTest, computeBoundsAcceptsMultiBatchAtPublicBoundary )
 {
     auto model = ModelBuilder::createMLP( 3, { 5 }, 2, true, false );
     BoundedTensor<torch::Tensor> inputBounds( torch::zeros( { 2, 3 } ), torch::ones( { 2, 3 } ) );
-    EXPECT_THROW(
-        model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::CROWN ),
-        std::runtime_error );
+    auto bounds =
+        model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::CROWN );
+    EXPECT_EQ( bounds.lower().sizes(), ( std::vector<int64_t>{ 2, 2 } ) );
+    EXPECT_EQ( bounds.upper().sizes(), ( std::vector<int64_t>{ 2, 2 } ) );
 }
 
 TEST_F( BaBStateTest, computeBoundsClearsNodeBoundsFromPriorInvocation )
@@ -82,13 +84,14 @@ TEST_F( BaBStateTest, computeBoundsStartsCleanAfterFailedInvocation )
 {
     auto reused = ModelBuilder::createMLP( 3, { 5 }, 2, true, false );
     auto narrow = BoundGenerator::epsilonBall( torch::zeros( { 1, 3 } ), 0.01 );
-    BoundedTensor<torch::Tensor> unsupportedBatch( torch::zeros( { 2, 3 } ),
-                                                   torch::ones( { 2, 3 } ) );
+    // Four elements are not a whole number of three-element samples
+    BoundedTensor<torch::Tensor> wrongSampleSize( torch::zeros( { 1, 4 } ),
+                                                  torch::ones( { 1, 4 } ) );
     (void)reused->compute_bounds( narrow, nullptr, LunaConfiguration::AnalysisMethod::CROWN );
     ASSERT_TRUE( reused->hasFinalAnalysisBounds() );
-    EXPECT_THROW( reused->compute_bounds( unsupportedBatch, nullptr,
+    EXPECT_THROW( reused->compute_bounds( wrongSampleSize, nullptr,
                                           LunaConfiguration::AnalysisMethod::CROWN ),
-                  std::runtime_error );
+                  LunaError );
     EXPECT_FALSE( reused->hasFinalAnalysisBounds() );
     for ( unsigned i = 0; i < reused->getNumNodes(); ++i )
     {
@@ -350,4 +353,35 @@ TEST_F( BaBStateTest, centerForwardPassRunsOncePerInputBox )
     auto shiftedBounds = BoundGenerator::epsilonBall( torch::ones( { 1, 3 } ), 0.1 );
     model->compute_bounds( shiftedBounds, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN );
     EXPECT_EQ( model->getShapeCachePassCount(), 2u );
+}
+
+// A search child starts from its parent's alphas, so it runs on its own step count and rate, as
+// alpha-beta-CROWN does with a smaller learning rate than its cold root
+TEST_F( BaBStateTest, warmStartRunsOnTheWarmIterationCountOnceAlphasArePersisted )
+{
+    auto model = ModelBuilder::createMLP( 3, { 5, 5 }, 2, true, true );
+    auto inputBounds = BoundGenerator::randomBounds( { 1, 3 }, -1.0, 1.0, 1.0 );
+    LunaConfiguration::ALPHA_ITERATIONS = 6;
+    LunaConfiguration::WARM_ALPHA_ITERATIONS = 2;
+    // Patience that never runs out, so the limit alone decides how many iterations run
+    LunaConfiguration::EARLY_STOP_PATIENCE = 1000;
+
+    model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN );
+    EXPECT_EQ( LunaConfiguration::LAST_LOWER_ALPHA_ITERATIONS, 6u ) << "a cold call is not warm";
+    ASSERT_TRUE( model->hasPersistedAlphas() );
+
+    model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN );
+    EXPECT_EQ( LunaConfiguration::LAST_LOWER_ALPHA_ITERATIONS, 2u ) << "a warm call is";
+}
+
+TEST_F( BaBStateTest, unsetWarmSettingsLeaveAWarmStartOnTheColdOnes )
+{
+    auto model = ModelBuilder::createMLP( 3, { 5, 5 }, 2, true, true );
+    auto inputBounds = BoundGenerator::randomBounds( { 1, 3 }, -1.0, 1.0, 1.0 );
+    LunaConfiguration::ALPHA_ITERATIONS = 6;
+    LunaConfiguration::EARLY_STOP_PATIENCE = 1000;
+
+    model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN );
+    model->compute_bounds( inputBounds, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN );
+    EXPECT_EQ( LunaConfiguration::LAST_LOWER_ALPHA_ITERATIONS, 6u );
 }

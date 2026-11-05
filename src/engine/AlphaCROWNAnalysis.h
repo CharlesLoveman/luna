@@ -81,9 +81,14 @@ public:
         return _reuseIntermediateBounds;
     }
 
+    /// \brief Warm start from persisted alphas for a batch of `lanes` search nodes.
+    ///
+    /// An alpha from a one-lane parent is copied to every lane, one with another lane count is
+    /// left out so that entry starts cold.
     void
     seedAlphas( const std::unordered_map<unsigned, std::unordered_map<std::string, AlphaParameters>>
-                    &alphas );
+                    &alphas,
+                int64_t lanes = 1 );
     void seedIntermediateBounds(
         const std::unordered_map<unsigned, std::pair<torch::Tensor, torch::Tensor>> &bounds );
     std::unordered_map<unsigned, std::unordered_map<std::string, AlphaParameters>>
@@ -210,11 +215,18 @@ private:
                                      int outDim, const torch::Tensor &input_lb,
                                      const torch::Tensor &input_ub );
 
-    void updateBestAlphas( const std::vector<int> &improvedIndices );
+    /// \brief Copy the current alphas into the best ones for each lane that improved.
+    ///
+    /// improvedLanes is one bool per lane. The whole alpha slice of a lane moves, for every start
+    /// node, as in auto_LiRPA.
+    void updateBestAlphas( const torch::Tensor &improvedLanes );
 
     void restoreBestAlphas();
 
-    void snapshotBestIntermediateBounds();
+    /// \brief Merge the current intermediate bounds into the best ones, element-wise.
+    ///
+    /// improvedLanes is one bool per lane, an undefined tensor merges every lane.
+    void snapshotBestIntermediateBounds( const torch::Tensor &improvedLanes = torch::Tensor() );
     void restoreBestIntermediateBounds();
 
     void _captureInitIntermediateBounds();
@@ -223,9 +235,6 @@ private:
     torch::Tensor computeLoss( const torch::Tensor &lowerBounds, const torch::Tensor &upperBounds,
                                bool optimizeLower,
                                c10::optional<torch::Tensor> stop_mask_opt = c10::nullopt );
-
-    std::vector<int> findImprovedIndices( const torch::Tensor &currentBounds,
-                                          const torch::Tensor &bestBounds, bool isLowerBound );
 
     bool shouldPerformOptimization() const;
 

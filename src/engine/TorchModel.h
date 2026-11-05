@@ -159,6 +159,21 @@ public:
         return _outputIndex;
     }
 
+    /// \brief Per-sample input shape without the batch dimension.
+    std::vector<int64_t> getInputSampleShape() const;
+
+    /// \brief Reshape flat or batched input values to `(B, *sampleShape)`.
+    ///
+    /// B is derived from the element count, so a flat `(n)` tensor is one sample and `(B, n)`
+    /// or `(B, *sampleShape)` is B samples. Throws when the count is not a multiple.
+    torch::Tensor toBatchedInput( const torch::Tensor &values ) const;
+
+    /// \brief Shape every persisted bound to one row per lane.
+    ///
+    /// A seed with the node's feature count is shared by all lanes, one with lanes times that count
+    /// is a row per lane, and anything else is an error.
+    void normalizePersistedIntermediateBounds( int64_t lanes );
+
     void setInputBounds( const BoundedTensor<torch::Tensor> &inputBounds );
 
     void setConcreteBounds( unsigned nodeIndex,

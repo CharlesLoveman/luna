@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 
 namespace NLR
@@ -144,17 +145,27 @@ AlphaParameters &AlphaCROWNAnalysis::ensureAlphaFor( unsigned nodeIndex,
     auto &perStart = _alphaByNodeStart[nodeIndex];
     auto it = perStart.find( startKey );
 
+    // Bounds are one row per lane and every lane shares one unstable set, the union of theirs
+    const int64_t lanes = input_lb.dim() >= 2 ? input_lb.size( 0 ) : 1;
     auto input_lb_flat = input_lb.detach().flatten();
     auto input_ub_flat = input_ub.detach().flatten();
+    auto input_lb_rows = input_lb.detach().reshape( { lanes, -1 } );
+    auto input_ub_rows = input_ub.detach().reshape( { lanes, -1 } );
     torch::Tensor unstableMask;
     auto nodePtr = _crownAnalysis->getNode( nodeIndex );
     if ( nodePtr && nodePtr->getNodeType() == NodeType::SIGMOID )
     {
+        if ( lanes > 1 )
+        {
+            throw std::runtime_error(
+                "AlphaCROWNAnalysis: sigmoid alpha does not support batch > 1 "
+                "yet" );
+        }
         unstableMask = ( input_ub_flat - input_lb_flat ) > 1e-6;
     }
     else
     {
-        unstableMask = ( input_lb_flat < 0 ) & ( input_ub_flat > 0 );
+        unstableMask = ( ( input_lb_rows < 0 ) & ( input_ub_rows > 0 ) ).any( 0 );
     }
     int numUnstable = unstableMask.sum().item<int>();
     bool need_new = ( it == perStart.end() );
@@ -168,16 +179,18 @@ AlphaParameters &AlphaCROWNAnalysis::ensureAlphaFor( unsigned nodeIndex,
 
             spec_mismatch = ( storedSpecDim != specDim ) &&
                             !( ap.hasSpecDefaultSlot && storedSpecDim == specDim + 1 );
+
+            // Alpha holds one slope per lane, so a different lane count needs a new tensor
+            spec_mismatch = spec_mismatch || ap.alpha.size( 2 ) != lanes;
         }
 
-        // A cached entry sized for a different unstable set cannot be scattered
-        // back onto this node's neurons - its alpha columns are positional
-        bool unstable_mismatch = ( ap.numUnstable != numUnstable );
-        if ( !unstable_mismatch && numUnstable > 0 && ap.unstableIndices.defined() )
+        // As in auto_LiRPA, an inherited entry stays as it is while every unstable neuron still has
+        // a column. A neuron that became stable is masked in the relaxation, so a search node
+        // keeps its parent's alphas and the answer does not depend on what the other lanes need
+        bool unstable_mismatch = true;
+        if ( ap.unstableMask.defined() && ap.unstableMask.sizes() == unstableMask.sizes() )
         {
-            auto currentIndices =
-                torch::nonzero( unstableMask ).flatten().to( ap.unstableIndices.options() );
-            unstable_mismatch = !ap.unstableIndices.equal( currentIndices );
+            unstable_mismatch = ( unstableMask & ap.unstableMask.logical_not() ).any().item<bool>();
         }
 
         // A frozen entry keeps the unstable set it was built for, since the optimizer holds it
@@ -206,11 +219,11 @@ AlphaParameters &AlphaCROWNAnalysis::ensureAlphaFor( unsigned nodeIndex,
         {
             if ( nodePtr && nodePtr->getNodeType() == NodeType::SIGMOID )
             {
-                params.alpha = torch::empty( { 2, specDim, 1, 0, 8 }, options );
+                params.alpha = torch::empty( { 2, specDim, lanes, 0, 8 }, options );
             }
             else
             {
-                params.alpha = torch::empty( { 2, specDim, 1, 0 }, options );
+                params.alpha = torch::empty( { 2, specDim, lanes, 0 }, options );
             }
             params.unstableIndices = torch::empty( { 0 }, torch::kLong );
             perStart[startKey] = std::move( params );
@@ -238,16 +251,21 @@ AlphaParameters &AlphaCROWNAnalysis::ensureAlphaFor( unsigned nodeIndex,
                 full_slope_debug = full_slope;
                 if ( full_slope.defined() && full_slope.numel() > 0 )
                 {
-                    slope_init = full_slope.flatten().index_select( 0, params.unstableIndices );
+                    // The CROWN slopes are per lane, a single row is shared by every lane
+                    auto slope_rows =
+                        full_slope.numel() == outDim
+                            ? full_slope.reshape( { 1, outDim } ).expand( { lanes, outDim } )
+                            : full_slope.reshape( { lanes, -1 } );
+                    slope_init = slope_rows.index_select( 1, params.unstableIndices );
                 }
                 else
                 {
-                    slope_init = torch::full( { numUnstable }, 0.5f, options );
+                    slope_init = torch::full( { lanes, numUnstable }, 0.5f, options );
                 }
             }
             else
             {
-                slope_init = torch::full( { numUnstable }, 0.5f, options );
+                slope_init = torch::full( { lanes, numUnstable }, 0.5f, options );
             }
         }
 
@@ -273,9 +291,9 @@ AlphaParameters &AlphaCROWNAnalysis::ensureAlphaFor( unsigned nodeIndex,
         torch::Tensor expanded;
         if ( alphaSlots == 1 )
         {
-            alpha = torch::zeros( { 2, specDimAlpha, 1, numUnstable }, options );
-            expanded = slope_init.view( { 1, 1, 1, numUnstable } )
-                           .expand( { 2, specDim, 1, numUnstable } )
+            alpha = torch::zeros( { 2, specDimAlpha, lanes, numUnstable }, options );
+            expanded = slope_init.view( { 1, 1, lanes, numUnstable } )
+                           .expand( { 2, specDim, lanes, numUnstable } )
                            .contiguous()
                            .clone()
                            .to( options.dtype() );
@@ -474,14 +492,18 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds( LunaConfiguration::Bou
         }
     } freezeAlphaSets( _freezeAlphaSets );
 
+    // Best bookkeeping follows auto_LiRPA: a lane improves when its bound summed over specs does,
+    // and only improved lanes save their alphas and intermediate bounds
     torch::Tensor bestBounds;
+    torch::Tensor savedReference;
     float currentLR = _learningRate;
     const unsigned early_stop_patience = LunaConfiguration::EARLY_STOP_PATIENCE;
-    unsigned iterations_without_improvement = 0;
-    torch::Tensor best_loss_tensor;
+    unsigned patience = 0;
+    unsigned iterationsExecuted = 0;
 
     for ( unsigned iter = 0; iter < _iteration; ++iter )
     {
+        iterationsExecuted = iter + 1;
         std::unique_ptr<torch::NoGradGuard> no_grad;
         if ( iter == _iteration - 1 )
         {
@@ -501,105 +523,105 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds( LunaConfiguration::Bou
         torch::Tensor currentBound =
             isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
         torch::Tensor currentBoundDetached = currentBound.detach();
+        const int64_t lanes = currentBoundDetached.dim() >= 2 ? currentBoundDetached.size( 0 ) : 1;
+        const torch::Tensor currentRows = currentBoundDetached.reshape( { lanes, -1 } );
 
+        // A lane whose properties are all proven stops contributing loss, the others go on
+        torch::Tensor stopLanes = torch::zeros( { lanes }, torch::kBool );
         if ( LunaConfiguration::STOP_ALPHA_ON_VERIFIED )
         {
-            torch::Tensor iterLb = extractLowerBoundsFromCROWN();
-            torch::Tensor iterUb = extractUpperBoundsFromCROWN();
-            if ( _torchModel->isSpecVerified( iterLb, iterUb ) )
+            const torch::Tensor lowerRows =
+                extractLowerBoundsFromCROWN().detach().reshape( { lanes, -1 } );
+            const torch::Tensor upperRows =
+                extractUpperBoundsFromCROWN().detach().reshape( { lanes, -1 } );
+            for ( int64_t lane = 0; lane < lanes; ++lane )
             {
-                std::cout << "Verified during alpha-CROWN at iteration " << iter << std::endl;
-                log( Stringf( "All specs verified at iteration %u", iter ) );
-                bestBounds =
-                    isLower ? torch::max( bestBounds.defined() ? bestBounds : currentBoundDetached,
-                                          currentBoundDetached )
-                            : torch::min( bestBounds.defined() ? bestBounds : currentBoundDetached,
-                                          currentBoundDetached );
-                break;
+                stopLanes[lane] = _torchModel->isSpecVerified( lowerRows[lane], upperRows[lane] );
             }
         }
+        const bool stopEveryLane = stopLanes.all().item<bool>();
 
+        // Lower side maximizes the summed bound and the upper side minimizes it
         torch::Tensor loss;
         if ( iter < _iteration - 1 )
         {
-            loss = isLower ? computeLoss( currentBound, torch::Tensor(), isLower )
-                           : computeLoss( torch::Tensor(), currentBound, isLower );
+            const torch::Tensor perLane = currentBound.reshape( { lanes, -1 } ).sum( 1 );
+            const torch::Tensor active = stopLanes.logical_not().to( perLane.device() );
+            loss = ( ( isLower ? -perLane : perLane ) * active.to( perLane.dtype() ) ).sum();
         }
 
-        bool improved = false;
-        std::vector<int> improvedIndices;
-
+        // Every iteration keeps the best bound of each lane that improved
+        bool needUpdate = false;
         if ( !bestBounds.defined() )
         {
-            bestBounds = currentBoundDetached.clone();
-            improved = true;
-            int64_t specDim =
-                currentBoundDetached.dim() == 0
-                    ? 1
-                    : ( currentBoundDetached.dim() == 1
-                            ? currentBoundDetached.size( 0 )
-                            : currentBoundDetached.size( currentBoundDetached.dim() - 1 ) );
-            improvedIndices.reserve( static_cast<size_t>( specDim ) );
-            for ( int64_t i = 0; i < specDim; ++i )
-            {
-                improvedIndices.push_back( static_cast<int>( i ) );
-            }
+            bestBounds = currentRows.clone();
+            savedReference = currentRows.clone();
         }
         else
         {
-            improvedIndices = findImprovedIndices( currentBoundDetached, bestBounds, isLower );
-            improved = !improvedIndices.empty();
-            if ( improved )
+            const torch::Tensor reducedNow = currentRows.sum( 1 );
+            const torch::Tensor reducedBest = bestBounds.sum( 1 );
+            const torch::Tensor improved =
+                isLower ? ( reducedNow > reducedBest ) : ( reducedNow < reducedBest );
+            needUpdate = improved.any().item<bool>();
+            if ( needUpdate )
             {
-                bestBounds = isLower ? torch::max( bestBounds, currentBoundDetached ).detach()
-                                     : torch::min( bestBounds, currentBoundDetached ).detach();
+                const torch::Tensor merged = isLower ? torch::max( bestBounds, currentRows )
+                                                     : torch::min( bestBounds, currentRows );
+                bestBounds = torch::where( improved.unsqueeze( 1 ), merged, bestBounds );
             }
         }
+        patience = needUpdate ? 0 : patience + 1;
 
-        bool shouldSaveBest =
+        // Alphas and intermediate bounds are saved on the first iteration, in the second half, and
+        // when patience runs out, and only for the lanes that beat their last saved result
+        const bool shouldSaveBest =
             ( iter < 1 ) ||
             ( iter > static_cast<unsigned>( _iteration * LunaConfiguration::START_SAVE_BEST ) ) ||
-            ( iterations_without_improvement >= early_stop_patience );
-
-        if ( improved && shouldSaveBest )
+            stopEveryLane || ( patience == early_stop_patience );
+        if ( shouldSaveBest )
         {
-            updateBestAlphas( improvedIndices );
-            snapshotBestIntermediateBounds();
-
-            if ( LunaConfiguration::STABILIZE_INTERMEDIATE_BOUNDS )
+            torch::Tensor savedLanes;
+            if ( iter < 1 )
             {
-                for ( const auto &[nodeIdx, bounds] : _bestIntermediateBounds )
-                {
-                    _referenceBounds[nodeIdx] = { bounds.first.detach().clone(),
-                                                  bounds.second.detach().clone() };
-                }
-                _crownAnalysis->setReferenceBounds( _referenceBounds );
-            }
-        }
-
-        if ( improved )
-        {
-            if ( loss.defined() )
-                best_loss_tensor = loss.detach().abs();
-            iterations_without_improvement = 0;
-        }
-        else if ( loss.defined() )
-        {
-            auto current_abs_loss = loss.detach().abs();
-            bool loss_improved =
-                !best_loss_tensor.defined() || ( current_abs_loss < best_loss_tensor ).item<bool>();
-            if ( loss_improved )
-            {
-                best_loss_tensor = current_abs_loss;
-                iterations_without_improvement = 0;
+                // On the bounds' device, since it is combined with them in torch::where below
+                savedLanes = torch::ones(
+                    { lanes },
+                    torch::TensorOptions().dtype( torch::kBool ).device( currentRows.device() ) );
             }
             else
             {
-                iterations_without_improvement++;
+                const torch::Tensor reducedNow = currentRows.sum( 1 );
+                const torch::Tensor reducedSaved = savedReference.sum( 1 );
+                savedLanes =
+                    isLower ? ( reducedNow > reducedSaved ) : ( reducedNow < reducedSaved );
+            }
+            if ( savedLanes.any().item<bool>() )
+            {
+                savedReference =
+                    torch::where( savedLanes.unsqueeze( 1 ), currentRows, savedReference );
+                updateBestAlphas( savedLanes );
+                snapshotBestIntermediateBounds( savedLanes );
+
+                if ( LunaConfiguration::STABILIZE_INTERMEDIATE_BOUNDS )
+                {
+                    for ( const auto &[nodeIdx, bounds] : _bestIntermediateBounds )
+                    {
+                        _referenceBounds[nodeIdx] = { bounds.first.detach().clone(),
+                                                      bounds.second.detach().clone() };
+                    }
+                    _crownAnalysis->setReferenceBounds( _referenceBounds );
+                }
             }
         }
 
-        if ( iterations_without_improvement >= early_stop_patience )
+        if ( stopEveryLane )
+        {
+            log( Stringf( "All specs verified at iteration %u", iter ) );
+            break;
+        }
+
+        if ( patience > early_stop_patience )
         {
             break;
         }
@@ -629,6 +651,9 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds( LunaConfiguration::Bou
             }
         }
     }
+
+    ( isLower ? LunaConfiguration::LAST_LOWER_ALPHA_ITERATIONS
+              : LunaConfiguration::LAST_UPPER_ALPHA_ITERATIONS ) = iterationsExecuted;
 
     restoreBestAlphas();
     _crownAnalysis->clearReferenceBounds();
@@ -714,21 +739,20 @@ std::vector<torch::Tensor> AlphaCROWNAnalysis::collectAlphaParameters()
     return params;
 }
 
-void AlphaCROWNAnalysis::updateBestAlphas( const std::vector<int> &improvedIndices )
+void AlphaCROWNAnalysis::updateBestAlphas( const torch::Tensor &improvedLanes )
 {
-    if ( improvedIndices.empty() )
+    if ( !improvedLanes.defined() || !improvedLanes.any().item<bool>() )
     {
         return;
     }
 
-    log( Stringf( "updateBestAlphas() - Updating best alphas for %zu improved specs",
-                  improvedIndices.size() ) );
+    log( Stringf( "updateBestAlphas() - Updating best alphas for %lld improved lanes",
+                  (long long)improvedLanes.sum().item<int64_t>() ) );
 
     auto &currentStorage = _alphaByNodeStart;
     auto &bestStorage = _bestAlphaByNodeStart;
 
     torch::NoGradGuard no_grad;
-    using torch::indexing::Slice;
 
     for ( auto &[nodeIdx, perStart] : currentStorage )
     {
@@ -758,24 +782,12 @@ void AlphaCROWNAnalysis::updateBestAlphas( const std::vector<int> &improvedIndic
                 continue;
             }
 
-            auto idxTensor = torch::tensor(
-                improvedIndices,
-                torch::TensorOptions().dtype( torch::kLong ).device( currentAlpha.device() ) );
-
-            if ( ap.hasSpecDefaultSlot )
-            {
-                idxTensor = idxTensor + 1;
-            }
-
-            auto validMask = idxTensor < currentAlpha.size( 1 );
-            idxTensor = idxTensor.index( { validMask } );
-            if ( idxTensor.numel() == 0 )
-            {
-                continue;
-            }
-
-            bestAp.alpha.index_put_( { Slice(), idxTensor },
-                                     currentAlpha.index( { Slice(), idxTensor } ) );
+            // A lane that improved takes its whole alpha slice, every start node alike
+            std::vector<int64_t> laneShape( currentAlpha.dim(), 1 );
+            laneShape[2] = improvedLanes.size( 0 );
+            bestAp.alpha =
+                torch::where( improvedLanes.to( currentAlpha.device() ).reshape( laneShape ),
+                              currentAlpha, bestAp.alpha );
         }
     }
 }
@@ -808,7 +820,7 @@ void AlphaCROWNAnalysis::restoreBestAlphas()
     }
 }
 
-void AlphaCROWNAnalysis::snapshotBestIntermediateBounds()
+void AlphaCROWNAnalysis::snapshotBestIntermediateBounds( const torch::Tensor &improvedLanes )
 {
     unsigned numNodesUpdated = 0;
     unsigned numNodesNew = 0;
@@ -853,8 +865,21 @@ void AlphaCROWNAnalysis::snapshotBestIntermediateBounds()
                 torch::Tensor &storedLower = it->second.first;
                 torch::Tensor &storedUpper = it->second.second;
 
-                storedLower = torch::max( storedLower, currentLower ).detach().clone();
-                storedUpper = torch::min( storedUpper, currentUpper ).detach().clone();
+                torch::Tensor mergedLower = torch::max( storedLower, currentLower );
+                torch::Tensor mergedUpper = torch::min( storedUpper, currentUpper );
+
+                // Only a lane that improved merges its new bounds, the others keep what they had
+                if ( improvedLanes.defined() && mergedLower.dim() >= 1 &&
+                     mergedLower.size( 0 ) == improvedLanes.size( 0 ) )
+                {
+                    std::vector<int64_t> laneShape( mergedLower.dim(), 1 );
+                    laneShape[0] = improvedLanes.size( 0 );
+                    const auto rows = improvedLanes.to( mergedLower.device() ).reshape( laneShape );
+                    mergedLower = torch::where( rows, mergedLower, storedLower );
+                    mergedUpper = torch::where( rows, mergedUpper, storedUpper );
+                }
+                storedLower = mergedLower.detach().clone();
+                storedUpper = mergedUpper.detach().clone();
                 numNodesUpdated++;
             }
             else
@@ -953,64 +978,6 @@ AlphaCROWNAnalysis::computeLoss( const torch::Tensor &lowerBounds, const torch::
     return loss;
 }
 
-std::vector<int> AlphaCROWNAnalysis::findImprovedIndices( const torch::Tensor &currentBounds,
-                                                          const torch::Tensor &bestBounds,
-                                                          bool isLowerBound )
-{
-
-    std::vector<int> improvedIndices;
-
-    if ( !currentBounds.defined() || !bestBounds.defined() ||
-         currentBounds.sizes() != bestBounds.sizes() )
-    {
-        return improvedIndices;
-    }
-
-    torch::Tensor improved =
-        isLowerBound ? ( currentBounds > bestBounds ) : ( currentBounds < bestBounds );
-
-    if ( !improved.defined() || improved.numel() == 0 )
-    {
-        return improvedIndices;
-    }
-
-    torch::Tensor perSpec;
-    if ( improved.dim() == 0 )
-    {
-        if ( improved.item<bool>() )
-        {
-            improvedIndices.push_back( 0 );
-        }
-        return improvedIndices;
-    }
-    else if ( improved.dim() == 1 )
-    {
-        perSpec = improved;
-    }
-    else
-    {
-        perSpec = improved;
-        for ( int d = 0; d < improved.dim() - 1; ++d )
-        {
-            perSpec = perSpec.any( 0 );
-        }
-    }
-
-    auto improvedMask = perSpec.nonzero().flatten().to( torch::kInt32 ).cpu().contiguous();
-    if ( improvedMask.numel() > 0 )
-    {
-        const int *data = improvedMask.data_ptr<int>();
-        int64_t n = improvedMask.size( 0 );
-        improvedIndices.reserve( static_cast<size_t>( n ) );
-        for ( int64_t i = 0; i < n; ++i )
-        {
-            improvedIndices.push_back( data[i] );
-        }
-    }
-
-    return improvedIndices;
-}
-
 bool AlphaCROWNAnalysis::shouldPerformOptimization() const
 {
     if ( !_alphaEnabled )
@@ -1050,8 +1017,8 @@ AlphaCROWNAnalysis::getAlphaForNodeAllSpecs( unsigned nodeIndex, const std::stri
     result.unstableIndices = ap.unstableIndices;
     result.hasSpecDefaultSlot = ap.hasSpecDefaultSlot;
 
-    // squeeze(2) drops batch dim, preserving gradient connection
-    result.alpha = ap.alpha.squeeze( 2 );
+    // ReLU alpha keeps its lane axis, the sigmoid alpha is single lane and stays squeezed
+    result.alpha = ap.alpha.dim() == 5 ? ap.alpha.squeeze( 2 ) : ap.alpha;
 
     return result;
 }
@@ -1187,14 +1154,26 @@ void AlphaCROWNAnalysis::preserveIntermediateBoundsForNextOptimization()
 }
 
 void AlphaCROWNAnalysis::seedAlphas(
-    const std::unordered_map<unsigned, std::unordered_map<std::string, AlphaParameters>> &alphas )
+    const std::unordered_map<unsigned, std::unordered_map<std::string, AlphaParameters>> &alphas,
+    int64_t lanes )
 {
     for ( auto &[nodeIdx, perStart] : alphas )
     {
         for ( auto &[startKey, ap] : perStart )
         {
+            torch::Tensor seededAlpha = ap.alpha.defined() ? ap.alpha.detach() : torch::Tensor();
+            if ( seededAlpha.defined() && seededAlpha.dim() >= 3 && seededAlpha.size( 2 ) != lanes )
+            {
+                // A one-lane parent warm starts every lane, any other lane count starts cold
+                if ( seededAlpha.size( 2 ) != 1 )
+                    continue;
+                std::vector<int64_t> sizes = seededAlpha.sizes().vec();
+                sizes[2] = lanes;
+                seededAlpha = seededAlpha.expand( sizes );
+            }
+
             AlphaParameters copy;
-            copy.alpha = ap.alpha.defined() ? ap.alpha.detach().clone() : torch::Tensor();
+            copy.alpha = seededAlpha.defined() ? seededAlpha.clone() : torch::Tensor();
             if ( copy.alpha.defined() )
                 copy.alpha.set_requires_grad( true );
             copy.unstableMask =

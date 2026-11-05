@@ -352,18 +352,57 @@ TEST_F( CROWNAnalysisTest, AddAMixedPatchesAndDenseRejectsIncompatibleFeaturesCl
     }
 }
 
-TEST_F( CROWNAnalysisTest, ConcreteBoundsRejectUnsupportedMultiBatchInsteadOfTruncating )
+TEST_F( CROWNAnalysisTest, ConcreteBoundsContractEachLaneWithItsOwnBox )
 {
     auto model = ModelBuilder::createMLP( 3, {}, 2, false, false );
     NLR::CROWNAnalysis analysis( model.get() );
-    auto A = torch::ones( { 2, 2, 3 } );
-    auto bias = torch::zeros( { 2, 2 } );
-    auto lower = torch::zeros( { 2, 3 } );
-    auto upper = torch::ones( { 2, 3 } );
+    // A is (spec=2, batch=2, features=3), spec 0 sums the inputs and spec 1 is -x0
+    auto A = torch::zeros( { 2, 2, 3 } );
+    A.select( 0, 0 ).fill_( 1.0 );
+    A.index_put_( { 1, torch::indexing::Slice(), 0 }, torch::tensor( -1.0 ) );
+    auto bias = torch::tensor( { { 10.0, 20.0 }, { 0.0, 0.0 } } );
+    // Lane 0 box is [0, 1], lane 1 box is [2, 4]
+    auto lower = torch::tensor( { { 0.0, 0.0, 0.0 }, { 2.0, 2.0, 2.0 } } );
+    auto upper = torch::tensor( { { 1.0, 1.0, 1.0 }, { 4.0, 4.0, 4.0 } } );
 
-    expectRuntimeErrorContaining( [&]()
-                                  { analysis.computeConcreteLowerBound( A, bias, lower, upper ); },
-                                  "does not support batch > 1" );
+    auto concrete = analysis.computeConcreteLowerBound( A, bias, lower, upper );
+
+    // Result is (batch, spec): lane 0 gives 10 + 0 and -1, lane 1 gives 20 + 6 and -4
+    auto expected = torch::tensor( { { 10.0, -1.0 }, { 26.0, -4.0 } } );
+    EXPECT_EQ( concrete.sizes(), expected.sizes() );
+    EXPECT_TRUE( torch::allclose( concrete, expected ) );
+}
+
+TEST_F( CROWNAnalysisTest, ConcreteUpperBoundsContractEachLaneWithItsOwnBox )
+{
+    auto model = ModelBuilder::createMLP( 3, {}, 2, false, false );
+    NLR::CROWNAnalysis analysis( model.get() );
+    auto A = torch::zeros( { 2, 2, 3 } );
+    A.select( 0, 0 ).fill_( 1.0 );
+    A.index_put_( { 1, torch::indexing::Slice(), 0 }, torch::tensor( -1.0 ) );
+    auto bias = torch::tensor( { { 10.0, 20.0 }, { 0.0, 0.0 } } );
+    auto lower = torch::tensor( { { 0.0, 0.0, 0.0 }, { 2.0, 2.0, 2.0 } } );
+    auto upper = torch::tensor( { { 1.0, 1.0, 1.0 }, { 4.0, 4.0, 4.0 } } );
+
+    auto concrete = analysis.computeConcreteUpperBound( A, bias, lower, upper );
+
+    // Lane 0 gives 10 + 3 and 0, lane 1 gives 20 + 12 and -2
+    auto expected = torch::tensor( { { 13.0, 0.0 }, { 32.0, -2.0 } } );
+    EXPECT_TRUE( torch::allclose( concrete, expected ) );
+}
+
+TEST_F( CROWNAnalysisTest, ConcreteBoundsShareOneBoxAcrossLanes )
+{
+    auto model = ModelBuilder::createMLP( 3, {}, 2, false, false );
+    NLR::CROWNAnalysis analysis( model.get() );
+    auto A = torch::ones( { 1, 3, 3 } );
+    auto bias = torch::zeros( { 1, 3 } );
+    auto lower = torch::zeros( { 1, 3 } );
+    auto upper = torch::ones( { 1, 3 } );
+
+    auto concrete = analysis.computeConcreteUpperBound( A, bias, lower, upper );
+
+    EXPECT_TRUE( torch::allclose( concrete, torch::full( { 3, 1 }, 3.0 ) ) );
 }
 
 TEST_F( CROWNAnalysisTest, ConcreteBoundsFlattenSpatialDenseFeatures )
@@ -377,7 +416,7 @@ TEST_F( CROWNAnalysisTest, ConcreteBoundsFlattenSpatialDenseFeatures )
 
     auto concrete = analysis.computeConcreteLowerBound( A, bias, lower, upper );
 
-    EXPECT_TRUE( torch::allclose( concrete, torch::full( { 2 }, 12.0 ) ) );
+    EXPECT_TRUE( torch::allclose( concrete, torch::full( { 1, 2 }, 12.0 ) ) );
 }
 
 TEST_F( CROWNAnalysisTest, PatchesConcretizationContainsOriginalFloatEndpoints )
@@ -444,5 +483,5 @@ TEST_F( CROWNAnalysisTest, ConcretizeRejectsFeatureMismatchInsteadOfFallingBackT
     analysis.addBias( 0, torch::zeros( { 2, 1 } ), torch::zeros( { 2, 1 } ) );
 
     expectRuntimeErrorContaining( [&]() { analysis.concretizeNode( 1, {} ); },
-                                  "input/A feature mismatch" );
+                                  "concretization: input has 2 elements for 3 features" );
 }

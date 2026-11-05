@@ -41,7 +41,14 @@ public:
     static bool VERBOSE;
 
     static unsigned ALPHA_ITERATIONS;
+    /// Iterations the last alpha optimization of each side actually ran, for diagnostics.
+    static unsigned LAST_LOWER_ALPHA_ITERATIONS;
+    static unsigned LAST_UPPER_ALPHA_ITERATIONS;
     static float ALPHA_LR;
+    /// Learning rate and step count of a call seeded with persisted alphas, such as a search node
+    /// starting from its parent. Zero means the same as ALPHA_LR and ALPHA_ITERATIONS.
+    static float WARM_ALPHA_LR;
+    static unsigned WARM_ALPHA_ITERATIONS;
     static float ALPHA_LR_DECAY;
     static bool KEEP_BEST;
     static bool USE_SHARED_ALPHA;

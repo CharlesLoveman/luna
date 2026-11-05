@@ -72,8 +72,15 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
     torch::Tensor input_lower = inputBound.lower();
     torch::Tensor input_upper = inputBound.upper();
 
+    // Bounds are one row per lane, a 1-D bound is a single lane
+    const int64_t lanes = input_lower.dim() >= 2 ? input_lower.size( 0 ) : 1;
+    input_lower = input_lower.reshape( { lanes, -1 } );
+    input_upper = input_upper.reshape( { lanes, -1 } );
+
     const BoundA &effective_lA = last_lA;
     const BoundA &effective_uA = last_uA;
+    const bool patchesPath = ( effective_lA.defined() && effective_lA.isPatches() ) ||
+                             ( effective_uA.defined() && effective_uA.isPatches() );
 
     int specDim = 1;
     auto inferSpecDim = []( const BoundA &A ) -> int
@@ -119,77 +126,48 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
     auto relaxation_result =
         _backwardRelaxation( effective_lA, effective_uA, input_lower, input_upper );
 
-    auto expand_like = []( torch::Tensor v, const torch::Tensor &A )
+    // Patches unfold one slope image per row, so alpha's (spec, lanes, F) becomes (spec*lanes, F)
+    // and the unfold selects the image of each spec and lane. CROWN slopes stay (lanes, F)
+    bool perSpecSlopes = false;
+    if ( patchesPath )
+    {
+        for ( torch::Tensor *slope :
+              { &relaxation_result.lb_lower_d, &relaxation_result.lb_upper_d,
+                &relaxation_result.ub_upper_d, &relaxation_result.ub_lower_d } )
+        {
+            if ( slope->defined() && slope->dim() == 3 )
+            {
+                perSpecSlopes = true;
+                *slope =
+                    slope->reshape( { slope->size( 0 ) * slope->size( 1 ), slope->size( 2 ) } );
+            }
+        }
+    }
+
+    // v is (lanes, F) for CROWN or (spec, lanes, F) for alpha, A is (spec, lanes or 1, *payload)
+    auto broadcast_like = []( const torch::Tensor &v, const torch::Tensor &A )
     {
         if ( !v.defined() || !A.defined() )
             return v;
-
-        if ( A.dim() >= 3 )
+        if ( A.dim() < 3 || v.dim() < 2 || v.dim() > 3 )
         {
-            std::vector<int64_t> payload_shape;
-            int64_t payload_numel = 1;
-            for ( int64_t d = 2; d < A.dim(); ++d )
-            {
-                payload_shape.push_back( A.size( d ) );
-                payload_numel *= A.size( d );
-            }
-
-            if ( v.dim() == 2 && v.size( 0 ) == A.size( 0 ) && v.size( 1 ) == payload_numel )
-            {
-                std::vector<int64_t> target_shape = { A.size( 0 ), 1 };
-                target_shape.insert( target_shape.end(), payload_shape.begin(),
-                                     payload_shape.end() );
-                return v.reshape( target_shape ).expand_as( A );
-            }
-
-            if ( v.numel() == A.size( 1 ) * payload_numel )
-            {
-                std::vector<int64_t> target_shape = { 1, A.size( 1 ) };
-                target_shape.insert( target_shape.end(), payload_shape.begin(),
-                                     payload_shape.end() );
-                return v.reshape( target_shape ).expand_as( A );
-            }
+            throw std::runtime_error( "BoundedReLUNode: A must be (spec, batch, ...) and the "
+                                      "slopes (batch, F) or (spec, batch, F)" );
         }
-
-        // Flat-to-conv mismatch: reshape v when numel matches A's payload dims
-        if ( v.numel() > 0 && A.dim() >= 3 )
+        std::vector<int64_t> shape = { v.dim() == 3 ? v.size( 0 ) : 1, v.size( -2 ) };
+        int64_t payload_numel = 1;
+        for ( int64_t d = 2; d < A.dim(); ++d )
         {
-            int64_t payload_numel = 1;
-            for ( int d = 2; d < A.dim(); ++d )
-                payload_numel *= A.size( d );
-            if ( v.numel() == payload_numel && v.dim() == 1 )
-            {
-                std::vector<int64_t> payload_shape;
-                for ( int d = 2; d < A.dim(); ++d )
-                    payload_shape.push_back( A.size( d ) );
-                v = v.view( payload_shape ).unsqueeze( 0 ).unsqueeze( 0 );
-            }
-            else if ( v.numel() == payload_numel && v.dim() == 2 && v.size( 0 ) == 1 )
-            {
-                std::vector<int64_t> payload_shape;
-                for ( int d = 2; d < A.dim(); ++d )
-                    payload_shape.push_back( A.size( d ) );
-                v = v.view( payload_shape ).unsqueeze( 0 ).unsqueeze( 0 );
-            }
+            shape.push_back( A.size( d ) );
+            payload_numel *= A.size( d );
         }
-
-        if ( A.dim() >= 2 && v.dim() == A.dim() - 2 )
+        if ( v.size( -1 ) != payload_numel )
         {
-            v = v.unsqueeze( 0 ).unsqueeze( 0 );
+            throw std::runtime_error( "BoundedReLUNode: slopes have " +
+                                      std::to_string( v.size( -1 ) ) + " features for A with " +
+                                      std::to_string( payload_numel ) );
         }
-        else if ( A.dim() >= 1 && v.dim() == A.dim() - 1 )
-        {
-            v = v.unsqueeze( 0 );
-        }
-
-        try
-        {
-            return v.expand_as( A );
-        }
-        catch ( ... )
-        {
-            return v;
-        }
+        return v.reshape( shape );
     };
 
     auto reduce_bias_like_A = [&]( const torch::Tensor &term, const torch::Tensor &A )
@@ -255,11 +233,13 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
         if ( effective_lA.isTensor() )
         {
             torch::Tensor lA = effective_lA.asTensor();
+            if ( lA.dim() == 2 )
+                lA = lA.unsqueeze( 1 );
             auto Apos = torch::clamp_min( lA, 0 );
             auto Aneg = torch::clamp_max( lA, 0 );
 
-            auto A_l = Apos * expand_like( aL_l, lA ) + Aneg * expand_like( aU_l, lA );
-            auto b_l = Apos * expand_like( bL_l, lA ) + Aneg * expand_like( bU_l, lA );
+            auto A_l = Apos * broadcast_like( aL_l, lA ) + Aneg * broadcast_like( aU_l, lA );
+            auto b_l = Apos * broadcast_like( bL_l, lA ) + Aneg * broadcast_like( bU_l, lA );
 
             new_lA = BoundA( A_l );
             auto add_lbias = reduce_bias_like_A( b_l, lA );
@@ -286,22 +266,26 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
                     t = t.unsqueeze( 0 );
             };
 
-            auto unfold_and_select_sparse =
-                [&patches]( const torch::Tensor &t, const torch::Tensor &P )
+            auto unfold_and_select_sparse = [&patches, lanes]( const torch::Tensor &t,
+                                                               const torch::Tensor &P,
+                                                               bool perSpec = false )
             {
                 torch::Tensor unfolded = inplace_unfold(
                     t, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
                     patches->inserted_zeros, patches->output_padding );
                 auto &idx = patches->unstable_idx.value();
-                if ( unfolded.size( 0 ) == 1 )
+                if ( !perSpec )
                 {
+                    // One image per lane shared by every spec, selected at each spec's location
                     return unfolded.permute( { 1, 2, 0, 3, 4, 5 } ).index( { idx[1], idx[2] } );
                 }
-                else
-                {
-                    auto arange_idx = torch::arange( unfolded.size( 0 ), idx[1].options() );
-                    return unfolded.index( { arange_idx, idx[1], idx[2] } ).unsqueeze( 1 );
-                }
+                // One image per spec and lane, each spec reads its own image at its own location
+                const int64_t specs = unfolded.size( 0 ) / lanes;
+                auto rows = unfolded.reshape( { specs, lanes, unfolded.size( 1 ),
+                                                unfolded.size( 2 ), unfolded.size( 3 ),
+                                                unfolded.size( 4 ), unfolded.size( 5 ) } );
+                auto arange_idx = torch::arange( specs, idx[1].options() );
+                return rows.index( { arange_idx, torch::indexing::Slice(), idx[1], idx[2] } );
             };
 
             torch::Tensor P = patches->patches;
@@ -312,8 +296,8 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
             {
                 ensure_4d( aL_l );
                 ensure_4d( aU_l );
-                torch::Tensor aL_sel = unfold_and_select_sparse( aL_l, P );
-                torch::Tensor aU_sel = unfold_and_select_sparse( aU_l, P );
+                torch::Tensor aL_sel = unfold_and_select_sparse( aL_l, P, perSpecSlopes );
+                torch::Tensor aU_sel = unfold_and_select_sparse( aU_l, P, perSpecSlopes );
 
                 torch::Tensor P_new = Ppos * aL_sel + Pneg * aU_sel;
                 new_lA = BoundA( patches->create_similar( P_new ) );
@@ -369,11 +353,13 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
         if ( effective_uA.isTensor() )
         {
             torch::Tensor uA = effective_uA.asTensor();
+            if ( uA.dim() == 2 )
+                uA = uA.unsqueeze( 1 );
             auto Apos = torch::clamp_min( uA, 0 );
             auto Aneg = torch::clamp_max( uA, 0 );
 
-            auto A_u = Apos * expand_like( aU_u, uA ) + Aneg * expand_like( aL_u, uA );
-            auto b_u = Apos * expand_like( bU_u, uA ) + Aneg * expand_like( bL_u, uA );
+            auto A_u = Apos * broadcast_like( aU_u, uA ) + Aneg * broadcast_like( aL_u, uA );
+            auto b_u = Apos * broadcast_like( bU_u, uA ) + Aneg * broadcast_like( bL_u, uA );
 
             new_uA = BoundA( A_u );
             auto add_ubias = reduce_bias_like_A( b_u, uA );
@@ -400,22 +386,26 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
                     t = t.unsqueeze( 0 );
             };
 
-            auto unfold_and_select_sparse =
-                [&patches]( const torch::Tensor &t, const torch::Tensor &P )
+            auto unfold_and_select_sparse = [&patches, lanes]( const torch::Tensor &t,
+                                                               const torch::Tensor &P,
+                                                               bool perSpec = false )
             {
                 torch::Tensor unfolded = inplace_unfold(
                     t, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
                     patches->inserted_zeros, patches->output_padding );
                 auto &idx = patches->unstable_idx.value();
-                if ( unfolded.size( 0 ) == 1 )
+                if ( !perSpec )
                 {
+                    // One image per lane shared by every spec, selected at each spec's location
                     return unfolded.permute( { 1, 2, 0, 3, 4, 5 } ).index( { idx[1], idx[2] } );
                 }
-                else
-                {
-                    auto arange_idx = torch::arange( unfolded.size( 0 ), idx[1].options() );
-                    return unfolded.index( { arange_idx, idx[1], idx[2] } ).unsqueeze( 1 );
-                }
+                // One image per spec and lane, each spec reads its own image at its own location
+                const int64_t specs = unfolded.size( 0 ) / lanes;
+                auto rows = unfolded.reshape( { specs, lanes, unfolded.size( 1 ),
+                                                unfolded.size( 2 ), unfolded.size( 3 ),
+                                                unfolded.size( 4 ), unfolded.size( 5 ) } );
+                auto arange_idx = torch::arange( specs, idx[1].options() );
+                return rows.index( { arange_idx, torch::indexing::Slice(), idx[1], idx[2] } );
             };
 
             torch::Tensor P = patches->patches;
@@ -426,8 +416,8 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
             {
                 ensure_4d( aU_u );
                 ensure_4d( aL_u );
-                torch::Tensor aU_sel = unfold_and_select_sparse( aU_u, P );
-                torch::Tensor aL_sel = unfold_and_select_sparse( aL_u, P );
+                torch::Tensor aU_sel = unfold_and_select_sparse( aU_u, P, perSpecSlopes );
+                torch::Tensor aL_sel = unfold_and_select_sparse( aL_u, P, perSpecSlopes );
 
                 torch::Tensor P_new = Ppos * aU_sel + Pneg * aL_sel;
                 new_uA = BoundA( patches->create_similar( P_new ) );
@@ -647,12 +637,12 @@ void BoundedReLUNode::_maskAlpha( const torch::Tensor &input_lower,
                                   const torch::Tensor &input_upper, const torch::Tensor &upper_d,
                                   RelaxationResult &result )
 {
-    auto input_lb_flat = input_lower.flatten();
-    auto input_ub_flat = input_upper.flatten();
-    auto always_active_mask = input_lb_flat >= 0;
-    auto always_inactive_mask = input_ub_flat <= 0;
-    auto unstable = ( input_lb_flat < 0 ) & ( input_ub_flat > 0 );
-    int outDim = (int)input_lb_flat.numel();
+    const int64_t lanes = input_lower.dim() >= 2 ? input_lower.size( 0 ) : 1;
+    auto input_lb_rows = input_lower.reshape( { lanes, -1 } );
+    auto input_ub_rows = input_upper.reshape( { lanes, -1 } );
+    auto always_active_mask = input_lb_rows >= 0;
+    auto always_inactive_mask = input_ub_rows <= 0;
+    int outDim = (int)input_lb_rows.size( 1 );
 
     if ( isAlphaOptimizationEnabled() && _alphaCrownAnalysis &&
          ( _optimizationStage == "opt" || _optimizationStage == "reuse" ) && _currentSpecDim > 0 )
@@ -681,7 +671,7 @@ void BoundedReLUNode::_maskAlpha( const torch::Tensor &input_lower,
         // Alpha columns are positional per unstable neuron, so a slot-count
         // mismatch means the cache is stale - fall back to CROWN slopes
         bool alpha_consistent =
-            alphaResult.alpha.defined() &&
+            alphaResult.alpha.defined() && alphaResult.alpha.size( 2 ) == lanes &&
             alphaResult.alpha.size( -1 ) == (long)alphaResult.numUnstable &&
             alphaResult.unstableIndices.defined() &&
             alphaResult.unstableIndices.numel() == (long)alphaResult.numUnstable;
@@ -733,45 +723,41 @@ void BoundedReLUNode::_maskAlpha( const torch::Tensor &input_lower,
                 (int)( alpha_unstable.defined() ? alpha_unstable.size( 1 ) : specDim );
             specDim = alphaSpecDim;
 
-            auto always_active_expanded =
-                always_active_mask.unsqueeze( 0 ).expand( { specDim, outDim } );
+            const std::vector<int64_t> fullShape = { specDim, lanes, outDim };
+            auto always_active_expanded = always_active_mask.unsqueeze( 0 ).expand( fullShape );
 
+            // Alpha is (spec, lanes, unstable), scattered at the union set shared by every lane
             auto alpha_lower_unstable = alpha_unstable[0];
             auto alpha_upper_unstable = alpha_unstable[1];
 
             auto indices = alphaResult.unstableIndices.to( options.device() )
-                               .unsqueeze( 0 )
-                               .expand( { specDim, alphaResult.numUnstable } );
+                               .reshape( { 1, 1, alphaResult.numUnstable } )
+                               .expand( { specDim, lanes, alphaResult.numUnstable } );
 
-            torch::Tensor alpha_lower_full = torch::zeros( { specDim, outDim }, options )
-                                                 .scatter( 1, indices, alpha_lower_unstable );
-            torch::Tensor alpha_upper_full = torch::zeros( { specDim, outDim }, options )
-                                                 .scatter( 1, indices, alpha_upper_unstable );
+            torch::Tensor alpha_lower_full =
+                torch::zeros( fullShape, options ).scatter( 2, indices, alpha_lower_unstable );
+            torch::Tensor alpha_upper_full =
+                torch::zeros( fullShape, options ).scatter( 2, indices, alpha_upper_unstable );
 
-            alpha_lower_full =
-                torch::where( always_active_expanded, torch::ones( { specDim, outDim }, options ),
-                              alpha_lower_full );
-            alpha_upper_full =
-                torch::where( always_active_expanded, torch::ones( { specDim, outDim }, options ),
-                              alpha_upper_full );
+            alpha_lower_full = torch::where( always_active_expanded,
+                                             torch::ones( fullShape, options ), alpha_lower_full );
+            alpha_upper_full = torch::where( always_active_expanded,
+                                             torch::ones( fullShape, options ), alpha_upper_full );
 
-            // A neuron that became inactive after its alpha was built outputs zero, so its slope is
-            // 0
-            auto always_inactive_expanded =
-                always_inactive_mask.unsqueeze( 0 ).expand( { specDim, outDim } );
-            alpha_lower_full =
-                torch::where( always_inactive_expanded,
-                              torch::zeros( { specDim, outDim }, options ), alpha_lower_full );
-            alpha_upper_full =
-                torch::where( always_inactive_expanded,
-                              torch::zeros( { specDim, outDim }, options ), alpha_upper_full );
+            // A neuron that is stable in one lane takes that lane's fixed slope whatever its alpha
+            // says, and one that became inactive after its alpha was built outputs zero
+            auto always_inactive_expanded = always_inactive_mask.unsqueeze( 0 ).expand( fullShape );
+            alpha_lower_full = torch::where( always_inactive_expanded,
+                                             torch::zeros( fullShape, options ), alpha_lower_full );
+            alpha_upper_full = torch::where( always_inactive_expanded,
+                                             torch::zeros( fullShape, options ), alpha_upper_full );
 
-            auto upper_d_flat = upper_d.flatten();
+            auto upper_d_rows = upper_d.reshape( { lanes, -1 } );
             auto upper_d_masked =
-                torch::where( always_active_mask, torch::ones_like( upper_d_flat ), upper_d_flat );
+                torch::where( always_active_mask, torch::ones_like( upper_d_rows ), upper_d_rows );
             upper_d_masked = torch::where( always_inactive_mask,
                                            torch::zeros_like( upper_d_masked ), upper_d_masked );
-            auto k_upper_spec = upper_d_masked.unsqueeze( 0 ).expand( { specDim, outDim } );
+            auto k_upper_spec = upper_d_masked.unsqueeze( 0 ).expand( fullShape );
 
             result.lb_lower_d = alpha_lower_full;
             result.lb_upper_d = k_upper_spec;
@@ -779,10 +765,10 @@ void BoundedReLUNode::_maskAlpha( const torch::Tensor &input_lower,
             result.ub_upper_d = k_upper_spec;
             result.ub_lower_d = alpha_upper_full;
 
-            auto b_upper = -input_lb_flat * upper_d_flat;
+            auto b_upper = -input_lb_rows * upper_d_rows;
             auto b_upper_masked = torch::where( always_active_mask | always_inactive_mask,
                                                 torch::zeros_like( b_upper ), b_upper );
-            result.bias_lower = torch::zeros_like( input_lb_flat );
+            result.bias_lower = torch::zeros_like( input_lb_rows );
             result.bias_upper = b_upper_masked;
 
             return;

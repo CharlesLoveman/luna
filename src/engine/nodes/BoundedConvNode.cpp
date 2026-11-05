@@ -926,31 +926,17 @@ BoundedTensor<torch::Tensor> BoundedConvNode::computeIntervalBoundPropagation(
     torch::Tensor input_lower = input.lower();
     torch::Tensor input_upper = input.upper();
 
-    if ( input_lower.dim() == 1 || ( input_lower.dim() == 2 && input_lower.size( 0 ) == 1 ) )
+    if ( input_lower.dim() == 1 || input_lower.dim() == 2 )
     {
+        // Flat bounds are one row per lane, a 1-D bound is a single lane
+        const int64_t lanes = input_lower.dim() == 2 ? input_lower.size( 0 ) : 1;
         if ( !input_shape.empty() && input_shape.size() >= 3 )
         {
-            if ( conv_dim == 1 && input_shape.size() == 3 )
-            {
-                input_lower =
-                    input_lower.reshape( { input_shape[0], input_shape[1], input_shape[2] } );
-                input_upper =
-                    input_upper.reshape( { input_shape[0], input_shape[1], input_shape[2] } );
-            }
-            else if ( input_shape.size() == 4 )
-            {
-                input_lower = input_lower.reshape(
-                    { input_shape[0], input_shape[1], input_shape[2], input_shape[3] } );
-                input_upper = input_upper.reshape(
-                    { input_shape[0], input_shape[1], input_shape[2], input_shape[3] } );
-            }
-            else if ( input_shape.size() == 3 )
-            {
-                input_lower =
-                    input_lower.reshape( { input_shape[0], input_shape[1], input_shape[2] } );
-                input_upper =
-                    input_upper.reshape( { input_shape[0], input_shape[1], input_shape[2] } );
-            }
+            // input_shape is one sample behind a leading batch of 1
+            std::vector<int64_t> laneShape = { lanes };
+            laneShape.insert( laneShape.end(), input_shape.begin() + 1, input_shape.end() );
+            input_lower = input_lower.reshape( laneShape );
+            input_upper = input_upper.reshape( laneShape );
         }
         else if ( conv_dim == 1 )
         {

@@ -739,6 +739,20 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph()
                 inputSize = BoundedOperationConverter::computeTensorSize( inputShape );
             }
             auto inputNode = std::make_shared<NLR::BoundedInputNode>( i, inputSize, tensorName );
+            std::vector<int64_t> sampleShape;
+            for ( unsigned dim : inputShape )
+            {
+                sampleShape.push_back( static_cast<int64_t>( dim ) );
+            }
+            // Symbolic dims are already dropped, so a leading 1 on a rank 2+ input is the batch
+            if ( sampleShape.size() >= 2 && sampleShape.front() == 1 )
+            {
+                sampleShape.erase( sampleShape.begin() );
+            }
+            if ( !sampleShape.empty() )
+            {
+                inputNode->setSampleShape( sampleShape );
+            }
             inputNode->setNodeIndex( i );
             nodes.append( inputNode );
             continue;

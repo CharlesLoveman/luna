@@ -109,8 +109,12 @@ std::shared_ptr<TorchModel> TorchModel::fromGraph( const TorchComputationGraph &
             {
                 throw std::invalid_argument( "TorchModel::fromGraph found an invalid input node" );
             }
-            node = std::make_shared<BoundedInputNode>( i, elementCount( description.shape ),
-                                                       description.name );
+            {
+                auto inputNode = std::make_shared<BoundedInputNode>(
+                    i, elementCount( description.shape ), description.name );
+                inputNode->setSampleShape( description.shape );
+                node = std::move( inputNode );
+            }
             inputIndices.append( i );
             break;
         case TorchGraphOperation::Relu:
@@ -896,13 +900,10 @@ BoundedTensor<torch::Tensor> TorchModel::compute_bounds(
 
     resetAnalysisState();
 
-    const auto &lower = input_bounds.lower();
-    const auto &upper = input_bounds.upper();
-    if ( ( lower.dim() > 1 && lower.size( 0 ) != 1 ) ||
-         ( upper.dim() > 1 && upper.size( 0 ) != 1 ) )
-    {
-        throw std::runtime_error( "TorchModel::compute_bounds requires batch size 1" );
-    }
+    // Reject inputs that are not whole samples before any state is written
+    const int64_t lanes = toBatchedInput( input_bounds.lower() ).size( 0 );
+    (void)toBatchedInput( input_bounds.upper() );
+    normalizePersistedIntermediateBounds( lanes );
 
     for ( const auto &[nodeIndex, bounds] : _persistedIntermediateBounds )
     {
@@ -1018,6 +1019,68 @@ BoundedTensor<torch::Tensor> TorchModel::runIBP( const BoundedTensor<torch::Tens
     return crownAnalysis->getOutputIBPBounds();
 }
 
+void TorchModel::normalizePersistedIntermediateBounds( int64_t lanes )
+{
+    for ( auto &[nodeIndex, bounds] : _persistedIntermediateBounds )
+    {
+        if ( nodeIndex >= _nodes.size() || !_nodes[nodeIndex] || !bounds.first.defined() ||
+             !bounds.second.defined() )
+            continue;
+        const int64_t features = _nodes[nodeIndex]->getOutputSize();
+        if ( features <= 0 )
+            continue;
+
+        // One row of the node's features is shared by every lane, otherwise there is a row per lane
+        const auto toRows = [&]( const torch::Tensor &seed )
+        {
+            if ( seed.numel() == features )
+                return seed.reshape( { 1, features } ).expand( { lanes, features } ).contiguous();
+            if ( seed.numel() == lanes * features )
+                return seed.reshape( { lanes, features } );
+            const std::string message = "Seeded bounds for node " + std::to_string( nodeIndex ) +
+                                        " have " + std::to_string( seed.numel() ) +
+                                        " values, expected " + std::to_string( features ) + " or " +
+                                        std::to_string( lanes * features );
+            throw LunaError( LunaError::INVALID_MODEL_STRUCTURE, message.c_str() );
+        };
+        bounds.first = toRows( bounds.first );
+        bounds.second = toRows( bounds.second );
+    }
+}
+
+std::vector<int64_t> TorchModel::getInputSampleShape() const
+{
+    if ( !_inputIndices.empty() && _inputIndices[0] < _nodes.size() )
+    {
+        auto inputNode = std::dynamic_pointer_cast<BoundedInputNode>( _nodes[_inputIndices[0]] );
+        if ( inputNode )
+        {
+            return inputNode->getSampleShape();
+        }
+    }
+    return { static_cast<int64_t>( _input_size ) };
+}
+
+torch::Tensor TorchModel::toBatchedInput( const torch::Tensor &values ) const
+{
+    const std::vector<int64_t> sampleShape = getInputSampleShape();
+    int64_t sampleCount = 1;
+    for ( const int64_t dimension : sampleShape )
+    {
+        sampleCount *= dimension;
+    }
+    if ( sampleCount <= 0 || values.numel() % sampleCount != 0 )
+    {
+        const std::string message = "Input has " + std::to_string( values.numel() ) +
+                                    " elements, not a multiple of the sample size " +
+                                    std::to_string( sampleCount );
+        throw LunaError( LunaError::INVALID_MODEL_STRUCTURE, message.c_str() );
+    }
+    std::vector<int64_t> shape = { values.numel() / sampleCount };
+    shape.insert( shape.end(), sampleShape.begin(), sampleShape.end() );
+    return values.reshape( shape );
+}
+
 void TorchModel::cacheForwardShapesFromCenter()
 {
     if ( !hasInputBounds() )
@@ -1040,27 +1103,8 @@ void TorchModel::cacheForwardShapesFromCenter()
     }
     const torch::Tensor boxCenter = center.clone();
 
-    // heuristic reshape to common image formats
-    if ( center.numel() == 9408 )
-    {
-        center = center.view( { 1, 3, 56, 56 } );
-    }
-    else if ( center.numel() == 12288 )
-    {
-        center = center.view( { 1, 3, 64, 64 } );
-    }
-    else if ( center.numel() == 3072 )
-    {
-        center = center.view( { 1, 3, 32, 32 } );
-    }
-    else if ( center.numel() == 784 )
-    {
-        center = center.view( { 1, 1, 28, 28 } );
-    }
-    else
-    {
-        center = center.view( { 1, (long)center.numel() } );
-    }
+    // Node shape caches are per sample, so one lane is enough to populate them
+    center = toBatchedInput( center ).narrow( 0, 0, 1 );
 
     try
     {
@@ -1101,7 +1145,16 @@ TorchModel::runAlphaCROWN( const BoundedTensor<torch::Tensor> &inputBounds, bool
     alphaCrownAnalysis->getCROWNAnalysis()->setInputBounds( inputBounds );
 
     if ( _hasPersistedAlphas )
-        alphaCrownAnalysis->seedAlphas( _persistedAlphas );
+    {
+        alphaCrownAnalysis->seedAlphas( _persistedAlphas,
+                                        toBatchedInput( inputBounds.lower() ).size( 0 ) );
+
+        // Alphas that start near an optimum are tuned with a smaller rate than a cold start
+        if ( LunaConfiguration::WARM_ALPHA_LR > 0.0f )
+            alphaCrownAnalysis->setLearningRate( LunaConfiguration::WARM_ALPHA_LR );
+        if ( LunaConfiguration::WARM_ALPHA_ITERATIONS > 0 )
+            alphaCrownAnalysis->setIterations( LunaConfiguration::WARM_ALPHA_ITERATIONS );
+    }
 
     // early stop if initial CROWN pass already verifies the property
     if ( LunaConfiguration::STOP_CROWN_ON_VERIFIED )
