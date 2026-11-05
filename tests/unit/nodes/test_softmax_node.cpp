@@ -65,7 +65,6 @@ TEST_F( SoftmaxNodeTest, ForwardPassBasic )
     torch::Tensor output = _softmaxNode->forward( input );
 
     // softmax(0) = 1/n
-    std::cout << output;
     torch::Tensor expected = torch::ones( { 1, 5 } ) * 0.2;
     EXPECT_TENSORS_CLOSE( output, expected, 1e-5, 1e-4 );
 }
@@ -100,4 +99,14 @@ TEST_F( SoftmaxNodeTest, SoundBounds )
         SoundnessChecker::verifySoundnessBySampling( *model, inputBounds, crownBounds, 500 ) );
     EXPECT_TRUE(
         SoundnessChecker::verifySoundnessBySampling( *model, inputBounds, alphaBounds, 500 ) );
+}
+
+TEST_F( SoftmaxNodeTest, MaxIsPerBatch )
+{
+    auto model = createMLPSoftmax( 2, { 2 }, 2 );
+    auto inputBounds = BoundGenerator::randomBounds( { 2, 2 }, 0.0, 1.0, 0.2 );
+    auto ibpBounds = model->runIBP( inputBounds );
+    auto crownBounds = model->runCROWN( inputBounds );
+    EXPECT_TRUE( torch::isfinite( crownBounds.lower() ).all().item<bool>() );
+    EXPECT_TRUE( torch::isfinite( crownBounds.upper() ).all().item<bool>() );
 }
