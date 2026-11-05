@@ -446,3 +446,10 @@ TEST_F( CROWNAnalysisTest, ConcretizeRejectsFeatureMismatchInsteadOfFallingBackT
     expectRuntimeErrorContaining( [&]() { analysis.concretizeNode( 1, {} ); },
                                   "input/A feature mismatch" );
 }
+
+TEST_F( CROWNAnalysisTest, ShouldHandleBatchSizeGreaterThanOne )
+{
+    auto model = ModelBuilder::createMLP( 2, { 2 }, 2, true, false );
+    auto inputBounds = BoundGenerator::randomBounds( { 2, 2 }, 0.0, 1.0, 0.2 );
+    auto crownBounds = model->runCROWN( inputBounds );
+}
