@@ -93,7 +93,7 @@ typedef std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> JacobianComp;
 std::tuple<JacobianComp, torch::Tensor>
 softmax_lse_lower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
 {
-    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) )[0];
+    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) );
     const torch::Tensor u_s = ub_p - max_u;
     const torch::Tensor l_s = lb_p - max_u;
     const torch::Tensor x0_s = x0_p - max_u;
@@ -118,7 +118,7 @@ softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
                    const torch::Tensor &sm_x0, const torch::Tensor &max_x0,
                    const torch::Tensor &sum_exp_x0 )
 {
-    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) )[0];
+    const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) );
     const torch::Tensor u_s = ub_p - max_u;
     const torch::Tensor l_s = lb_p - max_u;
     const torch::Tensor exp_u = torch::exp( u_s );
@@ -174,8 +174,8 @@ BoundA propagate( const BoundA &last_A,
 {
     const torch::Tensor A_p =
         move_dim_to_last( last_A.asTensor(), A_dim, last_A.asTensor().ndimension() );
-    const torch::Tensor A_pos = A_p.clamp( 0.0 );
-    const torch::Tensor A_neg = A_p.clamp( {}, 0.0 );
+    const torch::Tensor A_pos = A_p.clamp_min( 0.0 );
+    const torch::Tensor A_neg = A_p.clamp_max( 0.0 );
 
     const torch::Tensor next_A_pos = apply_jacobian_components( A_pos, J_pos_comp );
     const torch::Tensor next_A_neg = apply_jacobian_components( A_neg, J_neg_comp );
@@ -209,7 +209,7 @@ void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &las
 
     const torch::Tensor x0_p = ( lb_p + ub_p ) / 2.0;
 
-    const torch::Tensor max_x0 = std::get<0>( x0_p.max( -1, true ) )[0];
+    const torch::Tensor max_x0 = std::get<0>( x0_p.max( -1, true ) );
     const torch::Tensor x0_shifted = x0_p - max_x0;
     const torch::Tensor exp_x0 = torch::exp( x0_shifted );
     const torch::Tensor sum_exp_x0 = exp_x0.sum( -1, true );
