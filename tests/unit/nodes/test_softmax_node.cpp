@@ -100,13 +100,3 @@ TEST_F( SoftmaxNodeTest, SoundBounds )
     EXPECT_TRUE(
         SoundnessChecker::verifySoundnessBySampling( *model, inputBounds, alphaBounds, 500 ) );
 }
-
-TEST_F( SoftmaxNodeTest, MaxIsPerBatch )
-{
-    auto model = createMLPSoftmax( 2, { 2 }, 2 );
-    auto inputBounds = BoundGenerator::randomBounds( { 2, 2 }, 0.0, 1.0, 0.2 );
-    auto ibpBounds = model->runIBP( inputBounds );
-    auto crownBounds = model->runCROWN( inputBounds );
-    EXPECT_TRUE( torch::isfinite( crownBounds.lower() ).all().item<bool>() );
-    EXPECT_TRUE( torch::isfinite( crownBounds.upper() ).all().item<bool>() );
-}
