@@ -1031,12 +1031,26 @@ void TorchModel::normalizePersistedIntermediateBounds( int64_t lanes )
             continue;
 
         // One row of the node's features is shared by every lane, otherwise there is a row per lane
+        // A row keeps the shape it came with, since a convolution's bounds are not flat
         const auto toRows = [&]( const torch::Tensor &seed )
         {
             if ( seed.numel() == features )
-                return seed.reshape( { 1, features } ).expand( { lanes, features } ).contiguous();
+            {
+                std::vector<int64_t> rowShape = seed.sizes().vec();
+                if ( seed.dim() >= 2 && seed.size( 0 ) == 1 )
+                    rowShape.erase( rowShape.begin() );
+                std::vector<int64_t> shape = { 1 };
+                shape.insert( shape.end(), rowShape.begin(), rowShape.end() );
+                std::vector<int64_t> expanded = shape;
+                expanded[0] = lanes;
+                return seed.reshape( shape ).expand( expanded ).contiguous();
+            }
             if ( seed.numel() == lanes * features )
+            {
+                if ( seed.dim() >= 2 && seed.size( 0 ) == lanes )
+                    return seed;
                 return seed.reshape( { lanes, features } );
+            }
             const std::string message = "Seeded bounds for node " + std::to_string( nodeIndex ) +
                                         " have " + std::to_string( seed.numel() ) +
                                         " values, expected " + std::to_string( features ) + " or " +

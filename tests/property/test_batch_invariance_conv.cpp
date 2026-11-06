@@ -235,6 +235,31 @@ TEST_P( ConvBatchInvarianceTest, AlphaCrownOnIdenticalLanesMatchesTheSingleCall 
     }
 }
 
+TEST_P( ConvBatchInvarianceTest, SeededIntermediatesOfConvolutionsKeepTheirShape )
+{
+    // A search node seeds every node with the bounds of an earlier pass over the same network
+    const Zoo zoo = std::get<0>( GetParam() );
+    const int64_t batch = std::get<1>( GetParam() );
+    const auto boxes = makeBoxes( batch, zoo );
+    auto model = makeZooModel( zoo );
+    const auto first = model->compute_bounds(
+        boxes, nullptr, LunaConfiguration::AnalysisMethod::CROWN, true, true );
+
+    // A root solve recomputes every node and clips the result to the seeds
+    const bool previous = LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS;
+    LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS = true;
+    model->persistIntermediateBounds( model->getState().allBounds );
+    BoundedTensor<torch::Tensor> seeded;
+    EXPECT_NO_THROW( seeded = model->compute_bounds(
+                         boxes, nullptr, LunaConfiguration::AnalysisMethod::CROWN, true, true ) );
+    LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS = previous;
+
+    // Seeds that are the pass's own bounds change nothing
+    ASSERT_EQ( seeded.lower().sizes(), first.lower().sizes() );
+    EXPECT_LT( ( seeded.lower() - first.lower() ).abs().max().item<double>(), 1e-4 )
+        << zooName( zoo );
+}
+
 TEST_P( ConvBatchInvarianceTest, AlphaCrownTightensCrownSoTheComparisonIsNotVacuous )
 {
     skipSlowAlphaCases();
