@@ -174,6 +174,9 @@ public:
     /// is a row per lane, and anything else is an error.
     void normalizePersistedIntermediateBounds( int64_t lanes );
 
+    // Remember the shape of one row of a node's bounds, so a flat seed can be given it back
+    void rememberBoundRowShape( unsigned nodeIndex, const torch::Tensor &bounds );
+
     void setInputBounds( const BoundedTensor<torch::Tensor> &inputBounds );
 
     void setConcreteBounds( unsigned nodeIndex,
@@ -313,6 +316,8 @@ private:
     bool _hasFinalAnalysisBounds;
 
     std::unordered_map<unsigned, std::unordered_map<std::string, AlphaParameters>> _persistedAlphas;
+    // Shape of one row of each node's bounds as an earlier pass produced them, for flat seeds
+    std::unordered_map<unsigned, std::vector<int64_t>> _boundRowShapes;
     bool _hasPersistedAlphas{ false };
     std::unordered_map<unsigned, std::pair<torch::Tensor, torch::Tensor>>
         _persistedIntermediateBounds;

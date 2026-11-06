@@ -260,6 +260,34 @@ TEST_P( ConvBatchInvarianceTest, SeededIntermediatesOfConvolutionsKeepTheirShape
         << zooName( zoo );
 }
 
+TEST_P( ConvBatchInvarianceTest, FlatSeedsAreClippedToTheShapeOfAConvolution )
+{
+    // A caller that keeps bounds as plain vectors seeds a convolution with one flat row per lane
+    const Zoo zoo = std::get<0>( GetParam() );
+    const int64_t batch = std::get<1>( GetParam() );
+    const auto boxes = makeBoxes( batch, zoo );
+    auto model = makeZooModel( zoo );
+    const auto first = model->compute_bounds(
+        boxes, nullptr, LunaConfiguration::AnalysisMethod::CROWN, true, true );
+
+    std::unordered_map<unsigned, std::pair<torch::Tensor, torch::Tensor>> flat;
+    for ( const auto &[node, bounds] : model->getState().allBounds )
+        flat[node] = { bounds.first.reshape( { batch, -1 } ),
+                       bounds.second.reshape( { batch, -1 } ) };
+
+    const bool previous = LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS;
+    LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS = true;
+    model->persistIntermediateBounds( flat );
+    BoundedTensor<torch::Tensor> seeded;
+    EXPECT_NO_THROW( seeded = model->compute_bounds(
+                         boxes, nullptr, LunaConfiguration::AnalysisMethod::CROWN, true, true ) );
+    LunaConfiguration::RECOMPUTE_INTERMEDIATE_BOUNDS = previous;
+
+    ASSERT_EQ( seeded.lower().sizes(), first.lower().sizes() );
+    EXPECT_LT( ( seeded.lower() - first.lower() ).abs().max().item<double>(), 1e-3 )
+        << zooName( zoo );
+}
+
 TEST_P( ConvBatchInvarianceTest, AlphaCrownTightensCrownSoTheComparisonIsNotVacuous )
 {
     skipSlowAlphaCases();

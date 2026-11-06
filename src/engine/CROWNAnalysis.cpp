@@ -257,14 +257,27 @@ void CROWNAnalysis::computeIBPBounds()
 
         if ( node->hasBounds() )
         {
+            // A seed may hold the same values as a flat row, view it as the forward result is
+            // shaped
+            const auto likeForward = [&]( const torch::Tensor &seed, const torch::Tensor &forward )
+            {
+                return seed.numel() == forward.numel() && seed.sizes() != forward.sizes()
+                           ? seed.reshape( forward.sizes() )
+                           : seed;
+            };
             ibpBounds = BoundedTensor<torch::Tensor>(
-                torch::maximum( ibpBounds.lower(), node->getLower() ),
-                torch::minimum( ibpBounds.upper(), node->getUpper() ) );
+                torch::maximum( ibpBounds.lower(),
+                                likeForward( node->getLower(), ibpBounds.lower() ) ),
+                torch::minimum( ibpBounds.upper(),
+                                likeForward( node->getUpper(), ibpBounds.upper() ) ) );
         }
 
         // Detach to prevent gradient history leaking across iterations
         _ibpBounds[nodeIndex] =
             BoundedTensor<torch::Tensor>( ibpBounds.lower().detach(), ibpBounds.upper().detach() );
+
+        // A later flat seed for this node is viewed in the shape its forward bounds have
+        _torchModel->rememberBoundRowShape( nodeIndex, ibpBounds.lower() );
     }
 
     log( Stringf( "computeIBPBounds() - Completed, stored bounds for %u nodes",

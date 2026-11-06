@@ -23,8 +23,10 @@
 #include "nodes/BoundedReLUNode.h"
 #include "input_parsers/Operations.h"
 #include "OutputConstraint.h"
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <numeric>
 
 namespace NLR
 {
@@ -1019,6 +1021,14 @@ BoundedTensor<torch::Tensor> TorchModel::runIBP( const BoundedTensor<torch::Tens
     return crownAnalysis->getOutputIBPBounds();
 }
 
+void TorchModel::rememberBoundRowShape( unsigned nodeIndex, const torch::Tensor &bounds )
+{
+    if ( !bounds.defined() || bounds.dim() < 2 )
+        return;
+    const auto sizes = bounds.sizes();
+    _boundRowShapes[nodeIndex] = std::vector<int64_t>( sizes.begin() + 1, sizes.end() );
+}
+
 void TorchModel::normalizePersistedIntermediateBounds( int64_t lanes )
 {
     for ( auto &[nodeIndex, bounds] : _persistedIntermediateBounds )
@@ -1032,8 +1042,22 @@ void TorchModel::normalizePersistedIntermediateBounds( int64_t lanes )
 
         // One row of the node's features is shared by every lane, otherwise there is a row per lane
         // A row keeps the shape it came with, since a convolution's bounds are not flat
+        const auto remembered = _boundRowShapes.find( nodeIndex );
+        const bool hasRowShape =
+            remembered != _boundRowShapes.end() &&
+            std::accumulate( remembered->second.begin(), remembered->second.end(), int64_t( 1 ),
+                             std::multiplies<int64_t>() ) == features;
         const auto toRows = [&]( const torch::Tensor &seed )
         {
+            // A flat seed is given the shape an earlier pass produced for this node
+            if ( hasRowShape && ( seed.numel() == features || seed.numel() == lanes * features ) )
+            {
+                std::vector<int64_t> shape = { seed.numel() == features ? 1 : lanes };
+                shape.insert( shape.end(), remembered->second.begin(), remembered->second.end() );
+                std::vector<int64_t> expanded = shape;
+                expanded[0] = lanes;
+                return seed.reshape( shape ).expand( expanded ).contiguous();
+            }
             if ( seed.numel() == features )
             {
                 std::vector<int64_t> rowShape = seed.sizes().vec();
