@@ -58,6 +58,7 @@ public:
                              const std::string &name = "" );
     ModelBuilder &addBatchNorm( unsigned numFeatures, const std::string &name = "" );
     ModelBuilder &addAdd( const std::string &name = "" );
+    ModelBuilder &addAddConstant( const torch::Tensor &constant, const std::string &name = "" );
     ModelBuilder &addSigmoid( const std::string &name = "" );
     ModelBuilder &addFlatten( const std::string &name = "" );
     ModelBuilder &addReshape( const std::vector<int64_t> &shape, const std::string &name = "" );

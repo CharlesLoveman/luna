@@ -23,6 +23,12 @@ static inline torch::Tensor firstDefinedBoundTensor( const BoundedTensor<torch::
     return torch::Tensor();
 }
 
+// The constant is the same in every lane, so one lane of it is what a spec row multiplies
+static inline torch::Tensor oneLaneOf( const torch::Tensor &constant, const torch::Tensor &x )
+{
+    return x.defined() ? constant.narrow( 0, 0, 1 ).flatten() : constant.flatten();
+}
+
 static inline std::vector<int64_t> boundShapeVec( const BoundedTensor<torch::Tensor> &b )
 {
     torch::Tensor t = firstDefinedBoundTensor( b );
@@ -286,12 +292,12 @@ void BoundedAddNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA
                 }
                 else if ( lA_tensor.dim() == 2 )
                 {
-                    torch::Tensor constant = c_full.flatten();
+                    torch::Tensor constant = oneLaneOf( c_full, x );
                     constant_contrib = torch::matmul( lA_tensor, constant );
                 }
                 else if ( lA_tensor.dim() == 3 )
                 {
-                    torch::Tensor constant = c_full.flatten();
+                    torch::Tensor constant = oneLaneOf( c_full, x );
                     constant_contrib =
                         torch::matmul( lA_tensor, constant.unsqueeze( -1 ) ).squeeze( -1 );
                 }
@@ -335,12 +341,12 @@ void BoundedAddNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA
                 }
                 else if ( uA_tensor.dim() == 2 )
                 {
-                    torch::Tensor constant = c_full.flatten();
+                    torch::Tensor constant = oneLaneOf( c_full, x );
                     constant_contrib = torch::matmul( uA_tensor, constant );
                 }
                 else if ( uA_tensor.dim() == 3 )
                 {
-                    torch::Tensor constant = c_full.flatten();
+                    torch::Tensor constant = oneLaneOf( c_full, x );
                     constant_contrib =
                         torch::matmul( uA_tensor, constant.unsqueeze( -1 ) ).squeeze( -1 );
                 }

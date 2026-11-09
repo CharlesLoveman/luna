@@ -194,3 +194,36 @@ TEST_P( BatchInvarianceTest, OutputBoundsAreBatchFirst )
 }
 
 INSTANTIATE_TEST_SUITE_P( Batches, BatchInvarianceTest, ::testing::Values( 1, 2, 3, 4, 7, 8 ) );
+
+namespace
+{
+
+/// A 4-D input with a constant added, then flattened ahead of a small network, as in ACASXu
+std::shared_ptr<TorchModel> makeNormalizedMlp()
+{
+    torch::manual_seed( 2468 );
+    ModelBuilder builder;
+    builder.addInput( 5, "input" );
+    builder.addAddConstant( torch::rand( { 1, 1, 1, 5 } ) - 0.5, "input_Sub" );
+    builder.addFlatten( "flatten" );
+    builder.addLinear( 5, 10, "fc1" );
+    builder.addReLU( "relu1" );
+    builder.addLinear( 10, 3, "output" );
+    return builder.build();
+}
+
+} // namespace
+
+TEST_P( BatchInvarianceTest, AddedConstantCrownMatchesSingleCalls )
+{
+    const auto boxes = makeBatchBoxes( GetParam(), { 1, 1, 5 }, 11 );
+    expectLanesMatch(
+        runLanes( makeNormalizedMlp, boxes, LunaConfiguration::AnalysisMethod::CROWN ), 1e-4 );
+}
+
+TEST_P( BatchInvarianceTest, AddedConstantAlphaCrownMatchesSingleCalls )
+{
+    const auto boxes = makeBatchBoxes( GetParam(), { 1, 1, 5 }, 11 );
+    expectLanesMatch(
+        runLanes( makeNormalizedMlp, boxes, LunaConfiguration::AnalysisMethod::AlphaCROWN ), 1e-3 );
+}

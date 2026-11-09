@@ -161,6 +161,33 @@ ModelBuilder &ModelBuilder::addReLU( const std::string &name )
     return *this;
 }
 
+ModelBuilder &ModelBuilder::addAddConstant( const torch::Tensor &constant, const std::string &name )
+{
+    auto addNode = std::make_shared<NLR::BoundedAddNode>();
+    addNode->setConstantValue( constant );
+    unsigned nodeIndex = getNextNodeIndex();
+    addNode->setNodeIndex( nodeIndex );
+    if ( !name.empty() )
+    {
+        addNode->setNodeName( String( name.c_str() ) );
+    }
+
+    // Keeps the size of the node before it
+    if ( !_nodes.empty() )
+    {
+        unsigned prevOutSize = _nodes.back()->getOutputSize();
+        addNode->setInputSize( prevOutSize );
+        addNode->setOutputSize( prevOutSize );
+    }
+
+    _nodes.push_back( addNode );
+    if ( _nodes.size() > 1 )
+    {
+        addDependency( nodeIndex, nodeIndex - 1 );
+    }
+    return *this;
+}
+
 ModelBuilder &ModelBuilder::addConv2d( unsigned inChannels, unsigned outChannels,
                                        unsigned kernelSize, unsigned stride, unsigned padding,
                                        const std::string &name )
