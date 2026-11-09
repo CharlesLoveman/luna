@@ -23,10 +23,31 @@ static inline torch::Tensor firstDefinedBoundTensor( const BoundedTensor<torch::
     return torch::Tensor();
 }
 
-// The constant is the same in every lane, so one lane of it is what a spec row multiplies
-static inline torch::Tensor oneLaneOf( const torch::Tensor &constant, const torch::Tensor &x )
+// A spec row against one sample of the constant, which is the same in every lane
+// The matrix is [spec, lane, sample...], [spec, sample...] or the sample flattened
+static inline torch::Tensor
+constantContribution( const torch::Tensor &A, const torch::Tensor &cFull, const torch::Tensor &x )
 {
-    return x.defined() ? constant.narrow( 0, 0, 1 ).flatten() : constant.flatten();
+    const bool batched = x.defined() && x.dim() >= 2;
+    const torch::Tensor sample = batched ? cFull.narrow( 0, 0, 1 ).squeeze( 0 ) : cFull;
+    const int64_t sampleRank = sample.dim();
+    auto sumFrom = [&]( int64_t firstDim )
+    {
+        std::vector<int64_t> dims;
+        for ( int64_t d = firstDim; d < A.dim(); ++d )
+            dims.push_back( d );
+        return ( A * sample ).sum( dims );
+    };
+    if ( A.dim() == sampleRank + 2 )
+        return sumFrom( 2 );
+    if ( A.dim() == sampleRank + 1 )
+        return sumFrom( 1 );
+    if ( A.dim() == 3 )
+        return torch::matmul( A, sample.flatten().unsqueeze( -1 ) ).squeeze( -1 );
+    if ( A.dim() == 2 )
+        return torch::matmul( A, sample.flatten() );
+    throw std::runtime_error(
+        "BoundedAddNode::boundBackward: unsupported shape for constant bias" );
 }
 
 static inline std::vector<int64_t> boundShapeVec( const BoundedTensor<torch::Tensor> &b )
@@ -275,37 +296,7 @@ void BoundedAddNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA
                     x.defined() ? _constantValue.to( x.device() ).to( x.dtype() ) : _constantValue;
                 if ( x.defined() )
                     c_full = c_full.expand_as( x );
-                torch::Tensor constant_contrib;
-                if ( lA_tensor.dim() == c_full.dim() )
-                {
-                    std::vector<int64_t> sum_dims;
-                    for ( int64_t d = 1; d < lA_tensor.dim(); ++d )
-                        sum_dims.push_back( d );
-                    constant_contrib = ( lA_tensor * c_full ).sum( sum_dims );
-                }
-                else if ( lA_tensor.dim() == c_full.dim() + 1 )
-                {
-                    std::vector<int64_t> sum_dims;
-                    for ( int64_t d = 2; d < lA_tensor.dim(); ++d )
-                        sum_dims.push_back( d );
-                    constant_contrib = ( lA_tensor * c_full.unsqueeze( 1 ) ).sum( sum_dims );
-                }
-                else if ( lA_tensor.dim() == 2 )
-                {
-                    torch::Tensor constant = oneLaneOf( c_full, x );
-                    constant_contrib = torch::matmul( lA_tensor, constant );
-                }
-                else if ( lA_tensor.dim() == 3 )
-                {
-                    torch::Tensor constant = oneLaneOf( c_full, x );
-                    constant_contrib =
-                        torch::matmul( lA_tensor, constant.unsqueeze( -1 ) ).squeeze( -1 );
-                }
-                else
-                {
-                    throw std::runtime_error( "BoundedAddNode::boundBackward: unsupported last_lA "
-                                              "shape for constant bias" );
-                }
+                torch::Tensor constant_contrib = constantContribution( lA_tensor, c_full, x );
 
                 if ( lbias.defined() )
                 {
@@ -324,37 +315,7 @@ void BoundedAddNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA
                     x.defined() ? _constantValue.to( x.device() ).to( x.dtype() ) : _constantValue;
                 if ( x.defined() )
                     c_full = c_full.expand_as( x );
-                torch::Tensor constant_contrib;
-                if ( uA_tensor.dim() == c_full.dim() )
-                {
-                    std::vector<int64_t> sum_dims;
-                    for ( int64_t d = 1; d < uA_tensor.dim(); ++d )
-                        sum_dims.push_back( d );
-                    constant_contrib = ( uA_tensor * c_full ).sum( sum_dims );
-                }
-                else if ( uA_tensor.dim() == c_full.dim() + 1 )
-                {
-                    std::vector<int64_t> sum_dims;
-                    for ( int64_t d = 2; d < uA_tensor.dim(); ++d )
-                        sum_dims.push_back( d );
-                    constant_contrib = ( uA_tensor * c_full.unsqueeze( 1 ) ).sum( sum_dims );
-                }
-                else if ( uA_tensor.dim() == 2 )
-                {
-                    torch::Tensor constant = oneLaneOf( c_full, x );
-                    constant_contrib = torch::matmul( uA_tensor, constant );
-                }
-                else if ( uA_tensor.dim() == 3 )
-                {
-                    torch::Tensor constant = oneLaneOf( c_full, x );
-                    constant_contrib =
-                        torch::matmul( uA_tensor, constant.unsqueeze( -1 ) ).squeeze( -1 );
-                }
-                else
-                {
-                    throw std::runtime_error( "BoundedAddNode::boundBackward: unsupported last_uA "
-                                              "shape for constant bias" );
-                }
+                torch::Tensor constant_contrib = constantContribution( uA_tensor, c_full, x );
 
                 if ( ubias.defined() )
                 {

@@ -207,6 +207,7 @@ std::shared_ptr<TorchModel> makeNormalizedMlp()
     builder.addAddConstant( torch::rand( { 1, 1, 1, 5 } ) - 0.5, "input_Sub" );
     builder.addFlatten( "flatten" );
     builder.addLinear( 5, 10, "fc1" );
+    builder.addAddConstant( torch::rand( { 10 } ) - 0.5, "bias_Add" );
     builder.addReLU( "relu1" );
     builder.addLinear( 10, 3, "output" );
     return builder.build();
@@ -226,4 +227,36 @@ TEST_P( BatchInvarianceTest, AddedConstantAlphaCrownMatchesSingleCalls )
     const auto boxes = makeBatchBoxes( GetParam(), { 1, 1, 5 }, 11 );
     expectLanesMatch(
         runLanes( makeNormalizedMlp, boxes, LunaConfiguration::AnalysisMethod::AlphaCROWN ), 1e-3 );
+}
+
+// Bounds without a batch axis are the bounds of a batch of one, an added bias must not lose
+// elements
+TEST( AddedConstantTest, BoundsWithoutABatchAxisMatchABatchOfOne )
+{
+    at::set_num_threads( 1 );
+    LunaConfiguration::ALPHA_ITERATIONS = 5;
+    auto makeBiasedMlp = []()
+    {
+        torch::manual_seed( 1357 );
+        ModelBuilder builder;
+        builder.addInput( 5, "input" );
+        builder.addLinear( 5, 10, "fc1" );
+        builder.addAddConstant( torch::rand( { 10 } ) - 0.5, "bias_Add" );
+        builder.addReLU( "relu1" );
+        builder.addLinear( 10, 3, "output" );
+        return builder.build();
+    };
+    const auto batched = makeBatchBoxes( 1, { 5 }, 11 );
+    const BoundedTensor<torch::Tensor> flat( batched.lower().squeeze( 0 ),
+                                             batched.upper().squeeze( 0 ) );
+
+    const auto expected = makeBiasedMlp()->compute_bounds(
+        batched, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN, true, true );
+    const auto actual = makeBiasedMlp()->compute_bounds(
+        flat, nullptr, LunaConfiguration::AnalysisMethod::AlphaCROWN, true, true );
+
+    EXPECT_LT( ( expected.lower().flatten() - actual.lower().flatten() ).abs().max().item<double>(),
+               1e-4 );
+    EXPECT_LT( ( expected.upper().flatten() - actual.upper().flatten() ).abs().max().item<double>(),
+               1e-4 );
 }
