@@ -61,7 +61,7 @@ void BoundedSoftmaxNode::setOutputSize( unsigned size )
     _output_size = size;
 }
 
-const torch::Tensor move_dim_to_last( const torch::Tensor &t, int64_t dim, int64_t ndim )
+const torch::Tensor moveDimToLast( const torch::Tensor &t, int64_t dim, int64_t ndim )
 {
     if ( dim != ndim - 1 )
     {
@@ -70,8 +70,8 @@ const torch::Tensor move_dim_to_last( const torch::Tensor &t, int64_t dim, int64
     return t;
 }
 
-const torch::Tensor restore_dim( const torch::Tensor &t, const int64_t A_dim, const int64_t dim,
-                                 const int64_t ndim )
+const torch::Tensor restoreDim( const torch::Tensor &t, const int64_t A_dim, const int64_t dim,
+                                const int64_t ndim )
 {
     if ( dim != ndim - 1 )
     {
@@ -81,7 +81,7 @@ const torch::Tensor restore_dim( const torch::Tensor &t, const int64_t A_dim, co
     return t;
 }
 
-torch::Tensor expm1_div_x( const torch::Tensor &x )
+torch::Tensor expm1DivX( const torch::Tensor &x )
 {
     const torch::Tensor nonzero_x = torch::where( x == 0, torch::ones_like( x ), x );
     const torch::Tensor ratio = torch::expm1( x ) / nonzero_x;
@@ -91,19 +91,17 @@ torch::Tensor expm1_div_x( const torch::Tensor &x )
 typedef std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> JacobianComp;
 
 std::tuple<JacobianComp, torch::Tensor>
-softmax_lse_lower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
+softmaxLseLower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
 /*
  * lb_p: lower bound of the input to softmax
  * ub_p: upper bound of the input to softmax
  * x0_p: center of [lb_p, ub_p]
  *
- * L(x) = exp(x) / SE(x; l, u)
- *
  * Computes lower bound (39-40) in Wei et al 2023
- * J_L = diag(L(x)) - exp(x0) * (1/sum_exp(x0))^2 * (exp(u) - exp(l)) / (u - l)
- * Returns a tuple of (JacobianComp, b_L) where:
- *  J_L_comp: components of lower bound jacobian
- *  b_L: bias term for lower bound
+ *   J_L = diag(L(x)) - exp(x0) * (1/sum_exp(x0))^2 * (exp(u) - exp(l)) / (u - l)
+ * with
+ *   L(x) = exp(x) / SE(x; l, u)
+ *   Eq 9. SE(x; l, u) = sum((u - x)/(u - l) * exp(l) + (x - l)(u - l) * exp(u))
  */
 {
     const torch::Tensor max_u = std::get<0>( ub_p.max( -1, true ) );
@@ -118,10 +116,9 @@ softmax_lse_lower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
     // kappa = exp(l) * (exp(u - l) - 1) / (u - l)
     //       = (exp(u) - exp(l)) / (u - l)
     // avoids cancellation when interval is small
-    const torch::Tensor kappa = exp_l * expm1_div_x( diff );
+    const torch::Tensor kappa = exp_l * expm1DivX( diff );
 
     // se is the chordal upper bound on sum_exp(x0)
-    // Eq 9. SE(x; l, u) = sum((u - x)/(u - l) * exp(l) + (x - l)(u - l) * exp(u))
     // se_x0 = sum(exp(l) + (exp(u) - exp(l))/(u - l) * (x - l))
     //       = sum((u - l - x + l)/(u - l) * exp(l) + (x - l) * exp(u))
     //       = sum((u - x)/(u - l) * exp(l) + (x - l)/(u - l) * exp(u))
@@ -145,22 +142,22 @@ softmax_lse_lower( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
 }
 
 std::tuple<JacobianComp, torch::Tensor>
-softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
+softmaxLseUpper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const torch::Tensor &x0_p )
 /* lb_p: lower bound of the input to softmax
  * ub_p: upper bound of the input to softmax
  * x0_p: center of [lb_p, ub_p]
  *
- * u~_0 = 1
- * u~_i = exp(u_i - l_1)
- * l~_0 = 1
- * l~_i = exp(l_i - u_1)
- * 5a. p_under = 1 / sum(exp(u~))
- * 5b. p_bar = 1 / sum(exp(l~))
- *
  * Computes upper bound (46-47) in Wei et al 2023.
- * U_1 = -(p_bar - p_under)/(log(p_bar) - log(p_under)) * (exp(x) / SE(x) - 1)
- * U_i = -(p_bar - p_under)/(log(p_bar) - log(p_under)) * (exp(x) / SE(x))
- * J_U = diag(U_1) + U_i
+ *   U_1 = -(p_bar - p_under)/(log(p_bar) - log(p_under)) * (exp(x) / SE(x) - 1)
+ *   U_i = -(p_bar - p_under)/(log(p_bar) - log(p_under)) * (exp(x) / SE(x))
+ *   J_U = diag(U_1) + U_i
+ * with
+ *   5a. p_under = 1 / sum(exp(u~))
+ *   5b. p_bar = 1 / sum(exp(l~))
+ *     u~_0 = 1
+ *     u~_i = exp(u_i - l_1)
+ *     l~_0 = 1
+ *     l~_i = exp(l_i - u_1)
  */
 {
     // exp(center), shifted to avoid overflow
@@ -168,6 +165,7 @@ softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
     const torch::Tensor x0_shifted = x0_p - max_x0;
     const torch::Tensor exp_x0 = torch::exp( x0_shifted );
     const torch::Tensor sum_exp_x0 = exp_x0.sum( -1, true );
+
     // softmax of center (shifted)
     const torch::Tensor sm_x0 = exp_x0 / sum_exp_x0;
 
@@ -191,15 +189,12 @@ softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
 
     // Compute secant of exp
     // c_k_secant = (p_bar - p_under) / (log(p_bar) - log(p_under))
-    // c_k_expm1 = p_under * (exp(log(p_bar) - log(p_under)) - 1) / (log(p_bar) - log(p_under))
-    //           = (exp(log(p_under)) * exp(log(p_bar) - log(p_under)) - p_under) / (log(p_bar) -
-    //           log(p_under)) = (exp(log(p_bar)) - p_under) / (log(p_bar) - log(p_under)) =
-    //           c_k_secant
+    // c_k_expm1 is equivalent to c_k_secant
     const torch::Tensor use_expm1 = log_p_diff < 0.001;
     const torch::Tensor small_log_diff =
         torch::where( use_expm1, log_p_diff, torch::zeros_like( log_p_diff ) );
     // safe when log_diff small
-    const torch::Tensor c_k_expm1 = p_under * expm1_div_x( small_log_diff );
+    const torch::Tensor c_k_expm1 = p_under * expm1DivX( small_log_diff );
     const torch::Tensor safe_log_diff =
         torch::where( use_expm1, torch::ones_like( log_p_diff ), log_p_diff );
     // used otherwise
@@ -220,7 +215,7 @@ softmax_lse_upper( const torch::Tensor &lb_p, const torch::Tensor &ub_p, const t
     return std::tuple<JacobianComp, torch::Tensor>( J_U_comp, b_U );
 }
 
-torch::Tensor apply_jacobian_components( const torch::Tensor &A, const JacobianComp &J )
+torch::Tensor applyJacobianComponents( const torch::Tensor &A, const JacobianComp &J )
 /*
  * A: input tensor
  * J: Jacobian components (D, u, v), J = diag(D) * outer(u, v)
@@ -236,23 +231,26 @@ torch::Tensor apply_jacobian_components( const torch::Tensor &A, const JacobianC
     return term1 - term2;
 }
 
-BoundA propagate( const BoundA &last_A,
-                  const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> &J_pos_comp,
-                  const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> &J_neg_comp,
-                  const torch::Tensor &b_pos, const torch::Tensor &b_neg, const int64_t dim,
-                  const int64_t A_dim, const int64_t ndim, torch::Tensor &bias )
+torch::Tensor
+propagateTensor( const torch::Tensor &last_A,
+                 const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> &J_pos_comp,
+                 const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> &J_neg_comp,
+                 const torch::Tensor &b_pos, const torch::Tensor &b_neg, const int64_t dim,
+                 const int64_t A_dim, const int64_t ndim, torch::Tensor &bias )
+/*
+ * Split A into A+ and A-, then back propagate A_next = (A+ * J+) + (A- * J-)
+ */
 {
     // Move softmax axis to the last dimension for A to agree with Jacobian components
-    const torch::Tensor A_p =
-        move_dim_to_last( last_A.asTensor(), A_dim, last_A.asTensor().ndimension() );
+    const torch::Tensor A_p = moveDimToLast( last_A, A_dim, last_A.ndimension() );
     const torch::Tensor A_pos = A_p.clamp_min( 0.0 );
     const torch::Tensor A_neg = A_p.clamp_max( 0.0 );
 
-    const torch::Tensor next_A_pos = apply_jacobian_components( A_pos, J_pos_comp );
-    const torch::Tensor next_A_neg = apply_jacobian_components( A_neg, J_neg_comp );
+    const torch::Tensor next_A_pos = applyJacobianComponents( A_pos, J_pos_comp );
+    const torch::Tensor next_A_neg = applyJacobianComponents( A_neg, J_neg_comp );
 
     // Restore softmax axis to its original position in the next_A matrix
-    const BoundA next_A = BoundA( restore_dim( next_A_pos + next_A_neg, A_dim, dim, ndim ) );
+    const torch::Tensor next_A = restoreDim( next_A_pos + next_A_neg, A_dim, dim, ndim );
 
     bias =
         ( ( A_pos * b_pos.unsqueeze( 0 ) ).sum( -1 ) + ( A_neg * b_neg.unsqueeze( 0 ) ).sum( -1 ) );
@@ -263,10 +261,60 @@ BoundA propagate( const BoundA &last_A,
     return next_A;
 }
 
-void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA,
-                                        const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
-                                        Vector<Pair<BoundA, BoundA>> &outputA_matrices,
-                                        torch::Tensor &lbias, torch::Tensor &ubias )
+torch::Tensor reshapePayload( const torch::Tensor &A, const torch::Tensor &input )
+/*
+ * A: a tensor of shape (spec, lanes or 1, payload_numel)
+ * input: a tensor of shape (...input shape)
+ *
+ * Requires product(input shape) = payload_numel
+ *
+ * Returns A reshaped to (spec, lanes or 1, ...input shape)
+ */
+{
+    std::vector<int64_t> shape = {};
+    shape.push_back( A.size( 0 ) );
+    shape.push_back( A.size( 1 ) );
+    int64_t payload_numel = 1;
+    for ( int64_t d = 1; d < input.dim(); ++d )
+    {
+        shape.push_back( input.size( d ) );
+        payload_numel *= input.size( d );
+    }
+    if ( A.size( -1 ) != payload_numel )
+    {
+        throw std::runtime_error(
+            "BoundedSoftmaxNode: expected A dim -1 == product(input sizes), got A dim -1: " +
+            std::to_string( A.size( -1 ) ) +
+            ", product(input sizes): " + std::to_string( payload_numel ) );
+    }
+    return A.reshape( shape );
+}
+
+torch::Tensor restoreShape( const torch::Tensor &A )
+/*
+ * Inverse of reshapePayload
+ *
+ * A: a tensor of shape (spec, lanes or 1, ...input shape)
+ *
+ * Returns A reshaped to (spec, lanes or 1, product(input shape))
+ */
+{
+    std::vector<int64_t> shape = {};
+    shape.push_back( A.size( 0 ) );
+    shape.push_back( A.size( 1 ) );
+    int64_t payload_numel = 1;
+    for ( int64_t d = 2; d < A.dim(); ++d )
+    {
+        payload_numel *= A.size( d );
+    }
+    shape.push_back( payload_numel );
+    return A.reshape( shape );
+}
+
+void BoundedSoftmaxNode::boundBackwardTensor(
+    const torch::Tensor &last_lA, const torch::Tensor &last_uA,
+    const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
+    Vector<Pair<BoundA, BoundA>> &outputA_matrices, torch::Tensor &lbias, torch::Tensor &ubias )
 {
     const torch::Tensor &lb = inputBounds[0].lower();
     const torch::Tensor &ub = inputBounds[0].upper();
@@ -277,35 +325,89 @@ void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &las
     const int64_t A_dim = dim < 0 ? dim : dim + 1;
 
     // Move softmax axis to the last dimension
-    const torch::Tensor lb_p = move_dim_to_last( lb, dim, ndim );
-    const torch::Tensor ub_p = move_dim_to_last( ub, dim, ndim );
+    const torch::Tensor lb_p = moveDimToLast( lb, dim, ndim );
+    const torch::Tensor ub_p = moveDimToLast( ub, dim, ndim );
+
+    // Reshape to (spec, lanes or 1, input shape)
+    const torch::Tensor lA = reshapePayload( last_lA, lb );
+    const torch::Tensor uA = reshapePayload( last_uA, lb );
 
     // Center of interval [lb_p, ub_p]
     const torch::Tensor x0_p = ( lb_p + ub_p ) / 2.0;
 
     // log-sum-exp lower bound jacobian and bias
-    const auto [J_L_comp, b_L] = softmax_lse_lower( lb_p, ub_p, x0_p );
+    const auto [J_L_comp, b_L] = softmaxLseLower( lb_p, ub_p, x0_p );
     // log-sum-exp upper bound jacobian and bias
-    const auto [J_U_comp, b_U] = softmax_lse_upper( lb_p, ub_p, x0_p );
+    const auto [J_U_comp, b_U] = softmaxLseUpper( lb_p, ub_p, x0_p );
 
-    const BoundA lA = propagate( last_lA, J_L_comp, J_U_comp, b_L, b_U, dim, A_dim, ndim, lbias );
-    const BoundA uA = propagate( last_uA, J_U_comp, J_L_comp, b_U, b_L, dim, A_dim, ndim, ubias );
+    // Compute new A from last A, jacobian, and bias terms
+    const torch::Tensor new_lA =
+        propagateTensor( lA, J_L_comp, J_U_comp, b_L, b_U, dim, A_dim, ndim, lbias );
+    const torch::Tensor new_uA =
+        propagateTensor( uA, J_U_comp, J_L_comp, b_U, b_L, dim, A_dim, ndim, ubias );
 
-    outputA_matrices.append( Pair<BoundA, BoundA>( lA, uA ) );
+    // Reshape back to (spec, lanes or 1, product(input shape))
+    outputA_matrices.append(
+        Pair<BoundA, BoundA>( restoreShape( new_lA ), restoreShape( new_uA ) ) );
+}
+
+void BoundedSoftmaxNode::boundBackwardPatches(
+    std::shared_ptr<Patches> last_lA, std::shared_ptr<Patches> last_uA,
+    const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
+    Vector<Pair<BoundA, BoundA>> &outputA_matrices, torch::Tensor &lbias, torch::Tensor &ubias )
+{
+    throw std::runtime_error( "BoundedSoftmaxNode: Patches mode not implemented" );
+}
+
+void BoundedSoftmaxNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA,
+                                        const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
+                                        Vector<Pair<BoundA, BoundA>> &outputA_matrices,
+                                        torch::Tensor &lbias, torch::Tensor &ubias )
+/*
+ * Backward bound propagation for softmax
+ * Uses the log-sum-exp bounds in Wei et al 2023
+ */
+{
+    if ( last_lA.isTensor() && last_uA.isTensor() )
+    {
+        boundBackwardTensor( last_lA.asTensor(), last_uA.asTensor(), inputBounds, outputA_matrices,
+                             lbias, ubias );
+    }
+    else if ( last_lA.isPatches() && last_uA.isPatches() )
+    {
+        boundBackwardPatches( last_lA.asPatches(), last_uA.asPatches(), inputBounds,
+                              outputA_matrices, lbias, ubias );
+    }
+    else
+    {
+        throw std::runtime_error( "BoundedSoftmaxNode: expected last_lA and last_uA to share the "
+                                  "same type, got last_lA isTensor: " +
+                                  std::to_string( last_lA.isTensor() ) +
+                                  ", last_uA isTensor: " + std::to_string( last_uA.isTensor() ) );
+    }
 }
 
 BoundedTensor<torch::Tensor> BoundedSoftmaxNode::computeIntervalBoundPropagation(
     const Vector<BoundedTensor<torch::Tensor>> &inputBounds )
+/*
+ * Softmax is monotonic so Softmax([l, u]) = [Softmax(l), Softmax(u)]
+ */
 {
     const int64_t axis = _softmaxModule->ptr()->options.dim();
     const torch::Tensor &h_L = inputBounds[0].lower();
+    if ( _output_size == 0 )
+    {
+        setOutputSize( h_L.numel() );
+    }
     const torch::Tensor &h_U = inputBounds[0].upper();
+
     // Shift to avoid overflow in exp
     const torch::Tensor shift = std::get<0>( h_U.max( axis, true ) );
     const torch::Tensor exp_L = torch::exp( h_L - shift );
     const torch::Tensor exp_U = torch::exp( h_U - shift );
     const torch::Tensor lower = exp_L / ( torch::sum( exp_U, axis, true ) - exp_U + exp_L );
     const torch::Tensor upper = exp_U / ( torch::sum( exp_L, axis, true ) - exp_L + exp_U );
+
     // Clamp all values (including nan) to the range [0, 1]
     const torch::Tensor finite_inputs =
         ( torch::isfinite( h_L ).all( axis, true ) & torch::isfinite( h_U ).all( axis, true ) );

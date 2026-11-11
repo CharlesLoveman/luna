@@ -74,6 +74,16 @@ public:
 
 private:
     std::shared_ptr<torch::nn::Softmax> _softmaxModule;
+
+    void boundBackwardTensor( const torch::Tensor &last_lA, const torch::Tensor &last_uA,
+                              const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
+                              Vector<Pair<BoundA, BoundA>> &outputA_matrices, torch::Tensor &lbias,
+                              torch::Tensor &ubias );
+
+    void boundBackwardPatches( std::shared_ptr<Patches> last_lA, std::shared_ptr<Patches> last_uA,
+                               const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
+                               Vector<Pair<BoundA, BoundA>> &outputA_matrices, torch::Tensor &lbias,
+                               torch::Tensor &ubias );
 };
 } // namespace NLR
 
