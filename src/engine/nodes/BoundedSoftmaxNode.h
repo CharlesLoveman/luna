@@ -49,10 +49,7 @@ public:
     {
         return _input_size;
     }
-    unsigned getOutputSize() const override
-    {
-        return _output_size;
-    }
+    unsigned getOutputSize() const override;
     bool isPerturbed() const override
     {
         return true;

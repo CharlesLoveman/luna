@@ -471,7 +471,8 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph()
                     }
                 }
                 else if ( node.op_type() == "Relu" || node.op_type() == "Sigmoid" ||
-                          node.op_type() == "Dropout" || node.op_type() == "BatchNormalization" )
+                          node.op_type() == "Softmax" || node.op_type() == "Dropout" ||
+                          node.op_type() == "BatchNormalization" )
                 {
                     if ( node.input_size() > 0 && shape_metadata.exists( node.input( 0 ) ) )
                     {
@@ -1032,7 +1033,8 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph()
                             }
                         }
                     }
-                    else if ( node.op_type() == "Relu" || node.op_type() == "Sigmoid" )
+                    else if ( node.op_type() == "Relu" || node.op_type() == "Sigmoid" ||
+                              node.op_type() == "Softmax" )
                     {
                         if ( node.input_size() > 0 && shape_metadata.exists( node.input( 0 ) ) )
                         {
@@ -1076,6 +1078,7 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph()
             continue;
 
         if ( ( node->getNodeType() == NLR::NodeType::RELU ||
+               node->getNodeType() == NLR::NodeType::SOFTMAX ||
                node->getNodeType() == NLR::NodeType::IDENTITY ||
                node->getNodeType() == NLR::NodeType::RESHAPE ||
                node->getNodeType() == NLR::NodeType::FLATTEN ||

@@ -25,7 +25,7 @@ BoundedSoftmaxNode::BoundedSoftmaxNode( const torch::nn::Softmax &softmaxModule,
     _nodeName = name;
     _nodeIndex = 0;
     _input_size = 0;
-    _output_size = 0;
+    setOutputSize( 0 );
 
     _requiresInputBounds.append( 0 );
     _ibpIntermediate = true;
@@ -36,7 +36,7 @@ torch::Tensor BoundedSoftmaxNode::forward( const torch::Tensor &input )
     if ( input.dim() > 0 )
     {
         _input_size = input.numel();
-        _output_size = input.numel();
+        setOutputSize( input.numel() );
     }
 
     return ( *_softmaxModule )( input );
@@ -59,6 +59,19 @@ void BoundedSoftmaxNode::setInputSize( unsigned size )
 void BoundedSoftmaxNode::setOutputSize( unsigned size )
 {
     _output_size = size;
+}
+
+unsigned BoundedSoftmaxNode::getOutputSize() const
+{
+    if ( _output_size == 0 && _input_size > 0 )
+    {
+        return _input_size;
+    }
+    if ( _output_size == 0 )
+    {
+        return 2;
+    }
+    return _output_size;
 }
 
 const torch::Tensor moveDimToLast( const torch::Tensor &t, int64_t dim, int64_t ndim )

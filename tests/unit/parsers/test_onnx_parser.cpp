@@ -70,7 +70,7 @@ TEST_F( ONNXParserTest, ParseModelWithNodes )
 
 TEST_F( ONNXParserTest, ParseModelWithSoftmax )
 {
-    std::string modelPath = RESOURCES_DIR "/onnx/toy_softmax.onnx";
+    std::string modelPath = RESOURCES_DIR "/onnx/softmax/toy_softmax.onnx";
 
     try
     {
