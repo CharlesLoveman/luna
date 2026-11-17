@@ -558,18 +558,14 @@ torch::Tensor Patches::ensure_4d( const torch::Tensor &t )
     {
         throw LunaError( LunaError::UNEXPECTED_TENSOR_SHAPE, "Expected patches with dimension 4" );
     }
-    int64_t batch = t.size( 0 ), channels = shape[1], height = shape[2], width = shape[3];
+    int64_t channels = shape[1], height = shape[2], width = shape[3];
     if ( t.dim() == 1 && t.size( 0 ) == channels * height * width )
     {
         return t.view( { 1, channels, height, width } );
     }
-    else if ( t.dim() == 1 && t.size( 0 ) == batch * channels * height * width )
-    {
-        return t.view( { batch, channels, height, width } );
-    }
     else if ( t.dim() == 2 && t.size( 1 ) == channels * height * width )
     {
-        return t.view( { batch, channels, height, width } );
+        return t.view( { t.size( 0 ), channels, height, width } );
     }
     else if ( t.dim() == 3 )
     {
