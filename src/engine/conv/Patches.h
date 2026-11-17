@@ -101,7 +101,7 @@ public:
 
     torch::Tensor ensure_4d( const torch::Tensor &t );
 
-    inline bool is_sparse()
+    inline bool is_sparse() const
     {
         return unstable_idx.has_value();
     }
