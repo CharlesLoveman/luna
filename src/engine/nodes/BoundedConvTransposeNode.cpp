@@ -434,7 +434,7 @@ BoundA BoundedConvTransposeNode::boundOneSide( const BoundA &last_A, const torch
         }
         else if ( last_patches->identity == 1 )
         {
-            if ( last_patches->unstable_idx.has_value() )
+            if ( last_patches->is_sparse() )
             {
                 throw std::runtime_error(
                     "BoundedConvTransposeNode: Sparse identity patches not implemented" );

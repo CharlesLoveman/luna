@@ -1700,7 +1700,7 @@ BoundA CROWNAnalysis::addA( const BoundA &A1, const BoundA &A2 )
                 int64_t W = p->output_shape[3];
                 int64_t n = C * H * W;
                 auto opts = denseSibling.options();
-                if ( p->unstable_idx.has_value() )
+                if ( p->is_sparse() )
                 {
                     auto &idx = p->unstable_idx.value();
                     int64_t batch = p->output_shape[0];

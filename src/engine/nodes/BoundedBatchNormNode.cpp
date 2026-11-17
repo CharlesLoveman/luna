@@ -470,7 +470,7 @@ BoundedBatchNormNode::boundOneSidePatches( const BoundA &last_A,
             torch::eye( C, torch::TensorOptions().dtype( torch::kFloat32 ).device( device ) ) *
             w.view( { -1 } );
 
-        if ( !patches->unstable_idx.has_value() )
+        if ( !patches->is_sparse() )
         {
             torch::Tensor P_new = eye_w.view( { C, 1, 1, 1, C, 1, 1 } )
                                       .expand( { C, batch, out_h, out_w, C, 1, 1 } )
@@ -547,7 +547,7 @@ BoundedBatchNormNode::boundOneSidePatches( const BoundA &last_A,
         inplace_unfold( bias_map, ksize, patches->stride, patches->padding, patches->inserted_zeros,
                         patches->output_padding );
 
-    if ( patches->unstable_idx.has_value() )
+    if ( patches->is_sparse() )
     {
         auto idx = patches->unstable_idx.value();
         if ( idx.size() < 3 )

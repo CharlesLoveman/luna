@@ -151,6 +151,12 @@ inline torch::Tensor unfoldAndSelectSparse( const std::shared_ptr<Patches> patch
 inline torch::Tensor propagateTensor( const torch::Tensor &A, const torch::Tensor &aL,
                                       const torch::Tensor &aU, const torch::Tensor &bL,
                                       const torch::Tensor &bU, torch::Tensor &bias )
+/*
+ * Helper function to compute tensor case for propagate
+ *
+ * Returns new_A = A+ * aL + A- * aU
+ * assigns bias  = reduce(A+ * bL + A- * bU)
+ */
 {
     torch::Tensor A_tensor = A;
     if ( A_tensor.dim() == 2 )
@@ -170,6 +176,12 @@ inline std::shared_ptr<Patches>
 propagateSparsePatches( const std::shared_ptr<Patches> patches, const int64_t lanes,
                         const bool perSpecSlopes, const torch::Tensor &aL, const torch::Tensor &aU,
                         const torch::Tensor &bL, const torch::Tensor &bU, torch::Tensor &bias )
+/*
+ * Helper function to compute sparse patches case for propagate
+ *
+ * Returns new_P = P+ * unfolded(aL) + P- * unfolded(aU)
+ * assigns bias  = P+ * unfolded(bL) + P- * unfolded(bU)
+ */
 {
     torch::Tensor P = patches->patches;
     torch::Tensor Ppos = torch::clamp_min( P, 0 );
@@ -195,6 +207,12 @@ inline std::shared_ptr<Patches>
 propagateDensePatches( const std::shared_ptr<Patches> patches, const torch::Tensor &aL,
                        const torch::Tensor &aU, const torch::Tensor &bL, const torch::Tensor &bU,
                        torch::Tensor &bias )
+/*
+ * Helper function to compute non-sparse patches case for propagate
+ *
+ * Returns new_P = P+ * unfolded(aL) + P- * unfolded(aU)
+ * assigns bias  = P+ * unfolded(bL) + P- * unfolded(bU)
+ */
 {
     torch::Tensor P = patches->patches;
     torch::Tensor Ppos = torch::clamp_min( P, 0 );
@@ -228,6 +246,21 @@ propagateDensePatches( const std::shared_ptr<Patches> patches, const torch::Tens
 inline BoundA propagate( const BoundA &A, const int64_t lanes, const bool perSpecSlopes,
                          const torch::Tensor &aL, const torch::Tensor &aU, const torch::Tensor &bL,
                          const torch::Tensor &bU, torch::Tensor &bias )
+/*
+ * A: last A bound
+ * lanes: number of lanes, only used for sparse patches
+ * perSpecSlopes: controls how sparse patches are unfolded for aL and aU
+ * aL, aU: a terms
+ * bL, bU: bias terms
+ * bias: reference to output bias term
+ *
+ * For lower bound pass [aL, aU] = [a lower bound, a upper bound]
+ * For upper bound pass [aL, aU] = [a upper bound, a lower bound]
+ * Similar for bias terms.
+ *
+ * Returns new_A = A+ * aL + A- * aU
+ * assigns bias  = reduce(A+ * bL + A- * bU)
+ */
 {
     if ( A.isTensor() )
     {
@@ -236,7 +269,7 @@ inline BoundA propagate( const BoundA &A, const int64_t lanes, const bool perSpe
 
     auto patches = A.asPatches();
 
-    if ( patches->unstable_idx.has_value() )
+    if ( patches->is_sparse() )
     {
         return BoundA(
             propagateSparsePatches( patches, lanes, perSpecSlopes, aL, aU, bL, bU, bias ) );

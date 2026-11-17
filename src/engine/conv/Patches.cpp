@@ -175,7 +175,7 @@ torch::Tensor Patches::matmul( const torch::Tensor &input, bool patch_abs,
     torch::Tensor unfold_input =
         inplace_unfold( inp, kernel_size, stride, padding, inserted_zeros, output_padding );
 
-    if ( unstable_idx.has_value() )
+    if ( is_sparse() )
     {
         int64_t out_c = output_shape[1];
         torch::Tensor uf = unfold_input.unsqueeze( 0 ).expand( { out_c, -1, -1, -1, -1, -1, -1 } );

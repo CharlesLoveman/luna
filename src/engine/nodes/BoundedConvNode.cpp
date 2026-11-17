@@ -694,7 +694,7 @@ BoundA BoundedConvNode::boundOneSide( const BoundA &last_A, const torch::Tensor 
         if ( last_patches->identity == 0 )
         {
             torch::Tensor patches_tensor;
-            bool is_sparse = last_patches->unstable_idx.has_value();
+            bool is_sparse = last_patches->is_sparse();
 
             if ( !relu_followed )
             {
@@ -763,7 +763,7 @@ BoundA BoundedConvNode::boundOneSide( const BoundA &last_A, const torch::Tensor 
             int64_t out_h = last_patches->output_shape[2];
             int64_t out_w = last_patches->output_shape[3];
 
-            if ( last_patches->unstable_idx.has_value() )
+            if ( last_patches->is_sparse() )
             {
                 const auto &unstable_idx = last_patches->unstable_idx.value();
 
@@ -837,7 +837,7 @@ BoundA BoundedConvNode::boundOneSide( const BoundA &last_A, const torch::Tensor 
                 Patches::patches_to_matrix( pieces, in_shape_64, new_stride_vec, new_padding_vec,
                                             out_shape_64, last_patches->unstable_idx, 0 );
 
-            if ( sum_bias.defined() && !last_patches->unstable_idx.has_value() )
+            if ( sum_bias.defined() && !last_patches->is_sparse() )
             {
                 sum_bias = sum_bias.permute( { 1, 0, 2, 3 } );
                 sum_bias = sum_bias.reshape( { sum_bias.size( 0 ), -1 } );

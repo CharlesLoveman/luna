@@ -100,6 +100,11 @@ public:
                           const std::vector<int64_t> &expand_shape = {} ) const;
 
     torch::Tensor ensure_4d( const torch::Tensor &t );
+
+    inline bool is_sparse()
+    {
+        return unstable_idx.has_value();
+    }
 };
 
 torch::Tensor insert_zeros( const torch::Tensor &image, int64_t s );

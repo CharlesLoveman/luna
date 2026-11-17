@@ -72,9 +72,15 @@ public:
     }
 
     int inferSpecDim() const
+    /*
+     * Returns the size of the spec dim for this BoundA
+     */
     {
         if ( !defined() )
+        {
+            // Default value 1, could throw an error instead?
             return 1;
+        }
         if ( isTensor() )
         {
             torch::Tensor t = asTensor();
@@ -89,7 +95,7 @@ public:
             auto p = asPatches();
             if ( !p )
                 return 1;
-            if ( p->unstable_idx.has_value() )
+            if ( p->is_sparse() )
             {
                 return (int)p->patches.size( 0 );
             }
