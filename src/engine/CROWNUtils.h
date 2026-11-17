@@ -175,9 +175,7 @@ propagateSparsePatches( const std::shared_ptr<Patches> patches, const int64_t la
     torch::Tensor Ppos = torch::clamp_min( P, 0 );
     torch::Tensor Pneg = torch::clamp_max( P, 0 );
 
-    std::cout << "computing aL_sel" << std::endl;
     torch::Tensor aL_sel = unfoldAndSelectSparse( patches, lanes, aL, P, perSpecSlopes );
-    std::cout << "computing aU_sel" << std::endl;
     torch::Tensor aU_sel = unfoldAndSelectSparse( patches, lanes, aU, P, perSpecSlopes );
 
     torch::Tensor P_new = Ppos * aL_sel + Pneg * aU_sel;
