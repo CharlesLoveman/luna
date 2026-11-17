@@ -547,20 +547,35 @@ torch::Tensor Patches::patches_to_matrix(
     return A_matrix;
 }
 
-void Patches::ensure_4d( torch::Tensor &t )
+torch::Tensor Patches::ensure_4d( const torch::Tensor &t )
 {
     if ( !t.defined() )
+    {
         throw LunaError( LunaError::UNEXPECTED_TENSOR_SHAPE, "Tensor undefined in ensure_4d" );
+    }
     auto &shape = input_shape;
-    if ( shape.size() < 4 )
+    if ( shape.size() != 4 )
+    {
         throw LunaError( LunaError::UNEXPECTED_TENSOR_SHAPE, "Expected patches with dimension 4" );
-    int64_t C = shape[1], H = shape[2], W = shape[3];
-    if ( t.dim() == 1 && t.size( 0 ) == C * H * W )
-        t = t.view( { 1, C, H, W } );
-    else if ( t.dim() == 2 && t.size( 1 ) == C * H * W )
-        t = t.view( { t.size( 0 ), C, H, W } );
+    }
+    int64_t batch = t.size( 0 ), channels = shape[1], height = shape[2], width = shape[3];
+    if ( t.dim() == 1 && t.size( 0 ) == channels * height * width )
+    {
+        return t.view( { 1, channels, height, width } );
+    }
+    else if ( t.dim() == 1 && t.size( 0 ) == batch * channels * height * width )
+    {
+        return t.view( { batch, channels, height, width } );
+    }
+    else if ( t.dim() == 2 && t.size( 1 ) == channels * height * width )
+    {
+        return t.view( { batch, channels, height, width } );
+    }
     else if ( t.dim() == 3 )
-        t = t.unsqueeze( 0 );
+    {
+        return t.unsqueeze( 0 );
+    }
+    return t;
 }
 
 } // namespace NLR

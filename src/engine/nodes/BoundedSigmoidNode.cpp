@@ -11,6 +11,7 @@
 
 #include "BoundedSigmoidNode.h"
 #include "AlphaCROWNAnalysis.h"
+#include "CROWNUtils.h"
 #include "configuration/LunaConfiguration.h"
 #include "conv/Patches.h"
 #include "Debug.h"
@@ -741,27 +742,6 @@ BoundedSigmoidNode::_backwardRelaxation( const BoundA & /* last_lA */, const Bou
     return result;
 }
 
-torch::Tensor BoundedSigmoidNode::maybe_unfold_patches( const torch::Tensor &d_tensor,
-                                                        const BoundA &last_A )
-{
-    if ( !d_tensor.defined() || !last_A.isPatches() )
-    {
-        return d_tensor;
-    }
-    auto patches = last_A.asPatches();
-
-    if ( d_tensor.dim() == 3 )
-    {
-        return maybe_unfold_patches( d_tensor.unsqueeze( 0 ), last_A );
-    }
-
-    torch::Tensor d_unfolded = inplace_unfold(
-        d_tensor, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-        patches->padding, patches->inserted_zeros, patches->output_padding );
-
-    return d_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-}
-
 void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &last_uA,
                                         const Vector<BoundedTensor<torch::Tensor>> &inputBounds,
                                         Vector<Pair<BoundA, BoundA>> &outputA_matrices,
@@ -777,6 +757,8 @@ void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &las
     torch::Tensor input_lower = inputBound.lower();
     torch::Tensor input_upper = inputBound.upper();
 
+    const int64_t lanes = input_lower.dim() >= 2 ? input_lower.size( 0 ) : 1;
+
     // Spec dim from A matrix for per-spec alpha
     int specDim = 1;
     if ( last_lA.defined() && last_lA.isTensor() )
@@ -791,84 +773,25 @@ void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &las
 
     auto relaxation_result = _backwardRelaxation( last_lA, last_uA, input_lower, input_upper );
 
-    // Per-spec slopes: v [spec, out], A [spec, batch, out] -> [spec, 1, out]
-    auto expand_like = []( torch::Tensor v, const torch::Tensor &A )
+    // Patches unfold one slope image per row, so alpha's (spec, lanes, F) becomes (spec*lanes, F)
+    // and the unfold selects the image of each spec and lane. CROWN slopes stay (lanes, F)
+    const bool patchesPath = ( last_lA.defined() && last_lA.isPatches() ) ||
+                             ( last_uA.defined() && last_uA.isPatches() );
+    bool perSpecSlopes = false;
+    if ( patchesPath )
     {
-        if ( !v.defined() || !A.defined() )
-            return v;
-
-        if ( v.dim() == 2 && A.dim() == 3 && v.size( 0 ) == A.size( 0 ) )
+        for ( torch::Tensor *slope :
+              { &relaxation_result.lb_lower_d, &relaxation_result.lb_upper_d,
+                &relaxation_result.ub_upper_d, &relaxation_result.ub_lower_d } )
         {
-            v = v.unsqueeze( 1 );
-            try
+            if ( slope->defined() && slope->dim() == 3 )
             {
-                return v.expand_as( A );
-            }
-            catch ( ... )
-            {
-                return v;
+                perSpecSlopes = true;
+                *slope =
+                    slope->reshape( { slope->size( 0 ) * slope->size( 1 ), slope->size( 2 ) } );
             }
         }
-
-        // Flat-to-conv mismatch: reshape v when numel matches A's payload dims
-        if ( v.numel() > 0 && A.dim() >= 3 )
-        {
-            int64_t payload_numel = 1;
-            for ( int d = 2; d < A.dim(); ++d )
-                payload_numel *= A.size( d );
-            if ( v.numel() == payload_numel && v.dim() == 1 )
-            {
-                std::vector<int64_t> payload_shape;
-                for ( int d = 2; d < A.dim(); ++d )
-                    payload_shape.push_back( A.size( d ) );
-                v = v.view( payload_shape ).unsqueeze( 0 ).unsqueeze( 0 );
-            }
-            else if ( v.numel() == payload_numel && v.dim() == 2 && v.size( 0 ) == 1 )
-            {
-                std::vector<int64_t> payload_shape;
-                for ( int d = 2; d < A.dim(); ++d )
-                    payload_shape.push_back( A.size( d ) );
-                v = v.view( payload_shape ).unsqueeze( 0 ).unsqueeze( 0 );
-            }
-        }
-
-        if ( A.dim() >= 2 && v.dim() == A.dim() - 2 )
-        {
-            v = v.unsqueeze( 0 ).unsqueeze( 0 );
-        }
-        else if ( A.dim() >= 1 && v.dim() == A.dim() - 1 )
-        {
-            v = v.unsqueeze( 0 );
-        }
-
-        try
-        {
-            return v.expand_as( A );
-        }
-        catch ( ... )
-        {
-            return v;
-        }
-    };
-
-    auto reduce_bias_like_A = [&]( const torch::Tensor &term, const torch::Tensor &A )
-    {
-        if ( !term.defined() || !A.defined() )
-            return term;
-        if ( A.dim() >= 3 )
-        {
-            std::vector<int64_t> dims;
-            for ( int64_t d = 2; d < term.dim(); ++d )
-                dims.push_back( d );
-            return dims.empty() ? term : term.sum( dims );
-        }
-        if ( A.dim() == 2 )
-        {
-            auto reduced = ( term.dim() >= 2 ) ? term.sum( { 1 } ) : term;
-            return reduced.dim() == 1 ? reduced.unsqueeze( 1 ) : reduced;
-        }
-        return term;
-    };
+    }
 
     BoundA new_lA, new_uA;
 
@@ -888,50 +811,7 @@ void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &las
                 ? relaxation_result.lb_upper_b
                 : ( relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper
                                                            : torch::zeros_like( input_lower ) );
-
-        if ( last_lA.isTensor() )
-        {
-            torch::Tensor lA = last_lA.asTensor();
-            auto Apos = torch::clamp_min( lA, 0 );
-            auto Aneg = torch::clamp_max( lA, 0 );
-            auto aL_l_exp = expand_like( aL_l, lA );
-            auto aU_l_exp = expand_like( aU_l, lA );
-            auto bL_l_exp = expand_like( bL_l, lA );
-            auto bU_l_exp = expand_like( bU_l, lA );
-            auto A_l = Apos * aL_l_exp + Aneg * aU_l_exp;
-            new_lA = BoundA( A_l );
-            auto b_l = Apos * bL_l_exp + Aneg * bU_l_exp;
-            auto add_lbias = reduce_bias_like_A( b_l, lA );
-            lbias = lbias.defined() ? ( lbias + add_lbias ) : add_lbias;
-        }
-        else
-        {
-            auto patches = last_lA.asPatches();
-            torch::Tensor aL_l_unfolded = maybe_unfold_patches( aL_l, last_lA );
-            torch::Tensor aU_l_unfolded = maybe_unfold_patches( aU_l, last_lA );
-            torch::Tensor P = patches->patches;
-            torch::Tensor Ppos = torch::clamp_min( P, 0 );
-            torch::Tensor Pneg = torch::clamp_max( P, 0 );
-            torch::Tensor P_new = Ppos * aL_l_unfolded + Pneg * aU_l_unfolded;
-            new_lA = BoundA( patches->create_similar( P_new ) );
-
-            if ( bL_l.dim() == 3 )
-                bL_l = bL_l.unsqueeze( 0 );
-            if ( bU_l.dim() == 3 )
-                bU_l = bU_l.unsqueeze( 0 );
-            torch::Tensor bL_l_unfolded = inplace_unfold(
-                bL_l, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-                patches->padding, patches->inserted_zeros, patches->output_padding );
-            torch::Tensor bL_l_ready = bL_l_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-            torch::Tensor bU_l_unfolded = inplace_unfold(
-                bU_l, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-                patches->padding, patches->inserted_zeros, patches->output_padding );
-            torch::Tensor bU_l_ready = bU_l_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-            torch::Tensor total_bias =
-                ( Ppos * bL_l_ready + Pneg * bU_l_ready ).sum( { -3, -2, -1 } );
-            total_bias = total_bias.permute( { 1, 0, 2, 3 } );
-            lbias = lbias.defined() ? ( lbias + total_bias ) : total_bias;
-        }
+        new_lA = propagate( last_lA, lanes, perSpecSlopes, aL_l, aU_l, bL_l, bU_l, lbias );
     }
 
     if ( last_uA.defined() )
@@ -950,50 +830,7 @@ void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &las
                 ? relaxation_result.ub_lower_b
                 : ( relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower
                                                            : torch::zeros_like( input_lower ) );
-
-        if ( last_uA.isTensor() )
-        {
-            torch::Tensor uA = last_uA.asTensor();
-            auto Apos = torch::clamp_min( uA, 0 );
-            auto Aneg = torch::clamp_max( uA, 0 );
-            auto aU_u_exp = expand_like( aU_u, uA );
-            auto aL_u_exp = expand_like( aL_u, uA );
-            auto bU_u_exp = expand_like( bU_u, uA );
-            auto bL_u_exp = expand_like( bL_u, uA );
-            auto A_u = Apos * aU_u_exp + Aneg * aL_u_exp;
-            new_uA = BoundA( A_u );
-            auto b_u = Apos * bU_u_exp + Aneg * bL_u_exp;
-            auto add_ubias = reduce_bias_like_A( b_u, uA );
-            ubias = ubias.defined() ? ( ubias + add_ubias ) : add_ubias;
-        }
-        else
-        {
-            auto patches = last_uA.asPatches();
-            torch::Tensor aU_u_unfolded = maybe_unfold_patches( aU_u, last_uA );
-            torch::Tensor aL_u_unfolded = maybe_unfold_patches( aL_u, last_uA );
-            torch::Tensor P = patches->patches;
-            torch::Tensor Ppos = torch::clamp_min( P, 0 );
-            torch::Tensor Pneg = torch::clamp_max( P, 0 );
-            torch::Tensor P_new = Ppos * aU_u_unfolded + Pneg * aL_u_unfolded;
-            new_uA = BoundA( patches->create_similar( P_new ) );
-
-            if ( bU_u.dim() == 3 )
-                bU_u = bU_u.unsqueeze( 0 );
-            if ( bL_u.dim() == 3 )
-                bL_u = bL_u.unsqueeze( 0 );
-            torch::Tensor bU_u_unfolded = inplace_unfold(
-                bU_u, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-                patches->padding, patches->inserted_zeros, patches->output_padding );
-            torch::Tensor bU_u_ready = bU_u_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-            torch::Tensor bL_u_unfolded = inplace_unfold(
-                bL_u, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-                patches->padding, patches->inserted_zeros, patches->output_padding );
-            torch::Tensor bL_u_ready = bL_u_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-            torch::Tensor total_bias =
-                ( Ppos * bU_u_ready + Pneg * bL_u_ready ).sum( { -3, -2, -1 } );
-            total_bias = total_bias.permute( { 1, 0, 2, 3 } );
-            ubias = ubias.defined() ? ( ubias + total_bias ) : total_bias;
-        }
+        new_uA = propagate( last_uA, lanes, perSpecSlopes, aU_u, aL_u, bU_u, bL_u, ubias );
     }
 
     if ( outputA_matrices.size() == 0 )

@@ -12,10 +12,12 @@
 #include "BoundedReLUNode.h"
 #include "AlphaCROWNAnalysis.h"
 #include "LunaConfiguration.h"
+#include "LunaError.h"
 #include "conv/Patches.h"
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include "CROWNUtils.h"
 
 namespace NLR
 {
@@ -115,79 +117,6 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
         }
     }
 
-    // v is (lanes, F) for CROWN or (spec, lanes, F) for alpha, A is (spec, lanes or 1, *payload)
-    auto broadcast_like = []( const torch::Tensor &v, const torch::Tensor &A )
-    {
-        if ( !v.defined() || !A.defined() )
-            return v;
-        if ( A.dim() < 3 || v.dim() < 2 || v.dim() > 3 )
-        {
-            throw std::runtime_error( "BoundedReLUNode: A must be (spec, batch, ...) and the "
-                                      "slopes (batch, F) or (spec, batch, F)" );
-        }
-        std::vector<int64_t> shape = { v.dim() == 3 ? v.size( 0 ) : 1, v.size( -2 ) };
-        int64_t payload_numel = 1;
-        for ( int64_t d = 2; d < A.dim(); ++d )
-        {
-            shape.push_back( A.size( d ) );
-            payload_numel *= A.size( d );
-        }
-        if ( v.size( -1 ) != payload_numel )
-        {
-            throw std::runtime_error( "BoundedReLUNode: slopes have " +
-                                      std::to_string( v.size( -1 ) ) + " features for A with " +
-                                      std::to_string( payload_numel ) );
-        }
-        return v.reshape( shape );
-    };
-
-    auto reduce_bias_like_A = [&]( const torch::Tensor &term, const torch::Tensor &A )
-    {
-        if ( !term.defined() || !A.defined() )
-            return term;
-
-        torch::Tensor result;
-        if ( A.dim() >= 3 )
-        {
-            std::vector<int64_t> dims;
-            for ( int64_t d = 2; d < term.dim(); ++d )
-                dims.push_back( d );
-            result = dims.empty() ? term : term.sum( dims );
-            if ( result.dim() == 2 && result.size( 0 ) == A.size( 0 ) &&
-                 result.size( 1 ) == A.size( 1 ) )
-            {
-                return result;
-            }
-        }
-        else if ( A.dim() == 2 )
-        {
-            if ( term.dim() >= 2 )
-            {
-                result = term.sum( { 1 } );
-            }
-            else
-            {
-                result = term;
-            }
-            if ( result.dim() == 1 )
-            {
-                result = result.unsqueeze( 1 );
-            }
-            return result;
-        }
-        else
-        {
-            result = term;
-        }
-
-        if ( result.dim() == 1 )
-        {
-            result = result.unsqueeze( 1 );
-        }
-
-        return result;
-    };
-
     BoundA new_lA, new_uA;
 
     if ( effective_lA.defined() )
@@ -201,97 +130,7 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
         auto bU_l = relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper
                                                            : torch::zeros_like( input_lower );
 
-        if ( effective_lA.isTensor() )
-        {
-            torch::Tensor lA = effective_lA.asTensor();
-            if ( lA.dim() == 2 )
-                lA = lA.unsqueeze( 1 );
-            auto Apos = torch::clamp_min( lA, 0 );
-            auto Aneg = torch::clamp_max( lA, 0 );
-
-            auto A_l = Apos * broadcast_like( aL_l, lA ) + Aneg * broadcast_like( aU_l, lA );
-            auto b_l = Apos * broadcast_like( bL_l, lA ) + Aneg * broadcast_like( bU_l, lA );
-
-            new_lA = BoundA( A_l );
-            auto add_lbias = reduce_bias_like_A( b_l, lA );
-            lbias = lbias.defined() ? ( lbias + add_lbias ) : add_lbias;
-        }
-        else
-        {
-            auto patches = effective_lA.asPatches();
-            bool is_sparse = patches->unstable_idx.has_value();
-
-            auto unfold_and_select_sparse = [&patches, lanes]( const torch::Tensor &t,
-                                                               const torch::Tensor &P,
-                                                               bool perSpec = false )
-            {
-                torch::Tensor unfolded = inplace_unfold(
-                    t, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                auto &idx = patches->unstable_idx.value();
-                if ( !perSpec )
-                {
-                    // One image per lane shared by every spec, selected at each spec's location
-                    return unfolded.permute( { 1, 2, 0, 3, 4, 5 } ).index( { idx[1], idx[2] } );
-                }
-                // One image per spec and lane, each spec reads its own image at its own location
-                const int64_t specs = unfolded.size( 0 ) / lanes;
-                auto rows = unfolded.reshape( { specs, lanes, unfolded.size( 1 ),
-                                                unfolded.size( 2 ), unfolded.size( 3 ),
-                                                unfolded.size( 4 ), unfolded.size( 5 ) } );
-                auto arange_idx = torch::arange( specs, idx[1].options() );
-                return rows.index( { arange_idx, torch::indexing::Slice(), idx[1], idx[2] } );
-            };
-
-            torch::Tensor P = patches->patches;
-            torch::Tensor Ppos = torch::clamp_min( P, 0 );
-            torch::Tensor Pneg = torch::clamp_max( P, 0 );
-
-            if ( is_sparse )
-            {
-                patches->ensure_4d( aL_l );
-                patches->ensure_4d( aU_l );
-                torch::Tensor aL_sel = unfold_and_select_sparse( aL_l, P, perSpecSlopes );
-                torch::Tensor aU_sel = unfold_and_select_sparse( aU_l, P, perSpecSlopes );
-
-                torch::Tensor P_new = Ppos * aL_sel + Pneg * aU_sel;
-                new_lA = BoundA( patches->create_similar( P_new ) );
-
-                patches->ensure_4d( bL_l );
-                patches->ensure_4d( bU_l );
-                torch::Tensor bL_sel = unfold_and_select_sparse( bL_l, P );
-                torch::Tensor bU_sel = unfold_and_select_sparse( bU_l, P );
-                torch::Tensor term1 = ( Ppos * bL_sel ).sum( { -3, -2, -1 } );
-                torch::Tensor term2 = ( Pneg * bU_sel ).sum( { -3, -2, -1 } );
-                torch::Tensor total_bias = term1 + term2;
-                lbias = lbias.defined() ? ( lbias + total_bias ) : total_bias;
-            }
-            else
-            {
-                torch::Tensor aL_l_unfolded = maybe_unfold_patches( aL_l, effective_lA );
-                torch::Tensor aU_l_unfolded = maybe_unfold_patches( aU_l, effective_lA );
-
-                torch::Tensor P_new = Ppos * aL_l_unfolded + Pneg * aU_l_unfolded;
-                new_lA = BoundA( patches->create_similar( P_new ) );
-
-                patches->ensure_4d( bL_l );
-                patches->ensure_4d( bU_l );
-                torch::Tensor bL_unfolded = inplace_unfold(
-                    bL_l, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                torch::Tensor bL_ready = bL_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-                torch::Tensor bU_unfolded = inplace_unfold(
-                    bU_l, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                torch::Tensor bU_ready = bU_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-
-                torch::Tensor term1 = ( Ppos * bL_ready ).sum( { -3, -2, -1 } );
-                torch::Tensor term2 = ( Pneg * bU_ready ).sum( { -3, -2, -1 } );
-                torch::Tensor total_bias = term1 + term2;
-                total_bias = total_bias.permute( { 1, 0, 2, 3 } );
-                lbias = lbias.defined() ? ( lbias + total_bias ) : total_bias;
-            }
-        }
+        new_lA = propagate( effective_lA, lanes, perSpecSlopes, aL_l, aU_l, bL_l, bU_l, lbias );
     }
 
     if ( effective_uA.defined() )
@@ -305,150 +144,13 @@ void BoundedReLUNode::boundBackward( const BoundA &last_lA, const BoundA &last_u
         auto bL_u = relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower
                                                            : torch::zeros_like( input_lower );
 
-        if ( effective_uA.isTensor() )
-        {
-            torch::Tensor uA = effective_uA.asTensor();
-            if ( uA.dim() == 2 )
-                uA = uA.unsqueeze( 1 );
-            auto Apos = torch::clamp_min( uA, 0 );
-            auto Aneg = torch::clamp_max( uA, 0 );
-
-            auto A_u = Apos * broadcast_like( aU_u, uA ) + Aneg * broadcast_like( aL_u, uA );
-            auto b_u = Apos * broadcast_like( bU_u, uA ) + Aneg * broadcast_like( bL_u, uA );
-
-            new_uA = BoundA( A_u );
-            auto add_ubias = reduce_bias_like_A( b_u, uA );
-            ubias = ubias.defined() ? ( ubias + add_ubias ) : add_ubias;
-        }
-        else
-        {
-            auto patches = effective_uA.asPatches();
-            bool is_sparse = patches->unstable_idx.has_value();
-
-            auto unfold_and_select_sparse = [&patches, lanes]( const torch::Tensor &t,
-                                                               const torch::Tensor &P,
-                                                               bool perSpec = false )
-            {
-                torch::Tensor unfolded = inplace_unfold(
-                    t, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                auto &idx = patches->unstable_idx.value();
-                if ( !perSpec )
-                {
-                    // One image per lane shared by every spec, selected at each spec's location
-                    return unfolded.permute( { 1, 2, 0, 3, 4, 5 } ).index( { idx[1], idx[2] } );
-                }
-                // One image per spec and lane, each spec reads its own image at its own location
-                const int64_t specs = unfolded.size( 0 ) / lanes;
-                auto rows = unfolded.reshape( { specs, lanes, unfolded.size( 1 ),
-                                                unfolded.size( 2 ), unfolded.size( 3 ),
-                                                unfolded.size( 4 ), unfolded.size( 5 ) } );
-                auto arange_idx = torch::arange( specs, idx[1].options() );
-                return rows.index( { arange_idx, torch::indexing::Slice(), idx[1], idx[2] } );
-            };
-
-            torch::Tensor P = patches->patches;
-            torch::Tensor Ppos = torch::clamp_min( P, 0 );
-            torch::Tensor Pneg = torch::clamp_max( P, 0 );
-
-            if ( is_sparse )
-            {
-                patches->ensure_4d( aU_u );
-                patches->ensure_4d( aL_u );
-                torch::Tensor aU_sel = unfold_and_select_sparse( aU_u, P, perSpecSlopes );
-                torch::Tensor aL_sel = unfold_and_select_sparse( aL_u, P, perSpecSlopes );
-
-                torch::Tensor P_new = Ppos * aU_sel + Pneg * aL_sel;
-                new_uA = BoundA( patches->create_similar( P_new ) );
-
-                patches->ensure_4d( bU_u );
-                patches->ensure_4d( bL_u );
-                torch::Tensor bU_sel = unfold_and_select_sparse( bU_u, P );
-                torch::Tensor bL_sel = unfold_and_select_sparse( bL_u, P );
-                torch::Tensor term1 = ( Ppos * bU_sel ).sum( { -3, -2, -1 } );
-                torch::Tensor term2 = ( Pneg * bL_sel ).sum( { -3, -2, -1 } );
-                torch::Tensor total_bias = term1 + term2;
-                ubias = ubias.defined() ? ( ubias + total_bias ) : total_bias;
-            }
-            else
-            {
-                torch::Tensor aU_u_unfolded = maybe_unfold_patches( aU_u, effective_uA );
-                torch::Tensor aL_u_unfolded = maybe_unfold_patches( aL_u, effective_uA );
-
-                torch::Tensor P_new = Ppos * aU_u_unfolded + Pneg * aL_u_unfolded;
-                new_uA = BoundA( patches->create_similar( P_new ) );
-
-                patches->ensure_4d( bU_u );
-                patches->ensure_4d( bL_u );
-                torch::Tensor bU_unfolded = inplace_unfold(
-                    bU_u, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                torch::Tensor bU_ready = bU_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-                torch::Tensor bL_unfolded = inplace_unfold(
-                    bL_u, { P.size( -2 ), P.size( -1 ) }, patches->stride, patches->padding,
-                    patches->inserted_zeros, patches->output_padding );
-                torch::Tensor bL_ready = bL_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
-
-                torch::Tensor term1 = ( Ppos * bU_ready ).sum( { -3, -2, -1 } );
-                torch::Tensor term2 = ( Pneg * bL_ready ).sum( { -3, -2, -1 } );
-                torch::Tensor total_bias = term1 + term2;
-                total_bias = total_bias.permute( { 1, 0, 2, 3 } );
-                ubias = ubias.defined() ? ( ubias + total_bias ) : total_bias;
-            }
-        }
+        new_uA = propagate( effective_uA, lanes, perSpecSlopes, aU_u, aL_u, bU_u, bL_u, ubias );
     }
 
     if ( outputA_matrices.size() == 0 )
     {
         outputA_matrices.append( Pair<BoundA, BoundA>( new_lA, new_uA ) );
     }
-}
-
-torch::Tensor BoundedReLUNode::maybe_unfold_patches( const torch::Tensor &d_tensor,
-                                                     const BoundA &last_A )
-{
-    if ( !d_tensor.defined() || !last_A.isPatches() )
-    {
-        return d_tensor;
-    }
-    auto patches = last_A.asPatches();
-
-    if ( d_tensor.dim() <= 2 && patches->input_shape.size() >= 4 )
-    {
-        int64_t C = patches->input_shape[1];
-        int64_t H = patches->input_shape[2];
-        int64_t W = patches->input_shape[3];
-        int64_t batch = patches->input_shape[0];
-        torch::Tensor d_4d;
-        if ( d_tensor.dim() == 1 && d_tensor.size( 0 ) == C * H * W )
-        {
-            d_4d = d_tensor.view( { 1, C, H, W } );
-        }
-        else if ( d_tensor.dim() == 1 && d_tensor.size( 0 ) == batch * C * H * W )
-        {
-            d_4d = d_tensor.view( { batch, C, H, W } );
-        }
-        else if ( d_tensor.dim() == 2 && d_tensor.size( 1 ) == C * H * W )
-        {
-            d_4d = d_tensor.view( { d_tensor.size( 0 ), C, H, W } );
-        }
-        else
-        {
-            d_4d = d_tensor.view( { 1, C, H, W } );
-        }
-        return maybe_unfold_patches( d_4d, last_A );
-    }
-
-    if ( d_tensor.dim() == 3 )
-    {
-        return maybe_unfold_patches( d_tensor.unsqueeze( 0 ), last_A );
-    }
-
-    torch::Tensor d_unfolded = inplace_unfold(
-        d_tensor, { patches->patches.size( -2 ), patches->patches.size( -1 ) }, patches->stride,
-        patches->padding, patches->inserted_zeros, patches->output_padding );
-
-    return d_unfolded.permute( { 0, 1, 2, 3, 4, 5 } ).unsqueeze( 0 );
 }
 
 BoundedTensor<torch::Tensor> BoundedReLUNode::computeIntervalBoundPropagation(

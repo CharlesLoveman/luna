@@ -95,8 +95,6 @@ private:
     void _maskAlpha( const torch::Tensor &input_lower, const torch::Tensor &input_upper,
                      const torch::Tensor &upper_d, RelaxationResult &result );
 
-    torch::Tensor maybe_unfold_patches( const torch::Tensor &d_tensor, const BoundA &last_A );
-
     torch::Tensor init_upper_d;
     int _currentSpecDim{ 1 };
 
