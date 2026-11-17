@@ -56,6 +56,12 @@ inline torch::Tensor broadcastLike( const torch::Tensor &v, const torch::Tensor 
 }
 
 inline torch::Tensor reduceBiasLike( const torch::Tensor &term, const torch::Tensor &A )
+/*
+ * term: bias tensor
+ * A: A tensor
+ *
+ * Returns bias summed over dims > 2
+ */
 {
     if ( !term.defined() || !A.defined() )
     {
@@ -69,27 +75,17 @@ inline torch::Tensor reduceBiasLike( const torch::Tensor &term, const torch::Ten
         for ( int64_t d = 2; d < term.dim(); ++d )
             dims.push_back( d );
         result = dims.empty() ? term : term.sum( dims );
-        if ( result.dim() == 2 && result.size( 0 ) == A.size( 0 ) &&
-             result.size( 1 ) == A.size( 1 ) )
+        if ( !( result.dim() == 2 && result.size( 0 ) == A.size( 0 ) &&
+                result.size( 1 ) == A.size( 1 ) ) )
         {
-            return result;
-        }
-    }
-    else if ( A.dim() == 2 )
-    {
-        if ( term.dim() >= 2 )
-        {
-            result = term.sum( { 1 } );
-        }
-        else
-        {
-            result = term;
-        }
-        if ( result.dim() == 1 )
-        {
-            result = result.unsqueeze( 1 );
+            throw LunaError( LunaError::UNEXPECTED_TENSOR_SHAPE,
+                             "reduceBiasLike: expected reduced bias shape to equal A.shape[:2]" );
         }
         return result;
+    }
+    else if ( A.dim() == 2 && term.dim() >= 2 )
+    {
+        result = term.sum( { 1 } );
     }
     else
     {
@@ -106,6 +102,9 @@ inline torch::Tensor reduceBiasLike( const torch::Tensor &term, const torch::Ten
 
 inline torch::Tensor unfoldPatches( const torch::Tensor &d_tensor,
                                     const std::shared_ptr<Patches> patches )
+/*
+ * Helper to unfold non-sparse patches
+ */
 {
     if ( !d_tensor.defined() )
     {
@@ -117,6 +116,7 @@ inline torch::Tensor unfoldPatches( const torch::Tensor &d_tensor,
         throw LunaError( LunaError::INTERNAL_ERROR, "Tried to unfold patches with null patches" );
     }
 
+    // d_tensor reshaped to [batch, channels, height, width]
     torch::Tensor d_4d = patches->ensure_4d( d_tensor );
 
     torch::Tensor d_unfolded = inplace_unfold(
@@ -129,6 +129,9 @@ inline torch::Tensor unfoldPatches( const torch::Tensor &d_tensor,
 inline torch::Tensor unfoldAndSelectSparse( const std::shared_ptr<Patches> patches,
                                             const int64_t lanes, const torch::Tensor &t,
                                             const torch::Tensor &P, bool perSpec = false )
+/*
+ * Helper to unfold sparse patches
+ */
 {
     torch::Tensor t_4d = patches->ensure_4d( t );
     torch::Tensor unfolded =
