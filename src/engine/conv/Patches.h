@@ -98,6 +98,8 @@ public:
     // Bound computation via inplace_unfold + einsum (mirrors auto_LiRPA)
     torch::Tensor matmul( const torch::Tensor &input, bool patch_abs = false,
                           const std::vector<int64_t> &expand_shape = {} ) const;
+
+    void ensure_4d( torch::Tensor &t );
 };
 
 torch::Tensor insert_zeros( const torch::Tensor &image, int64_t s );

@@ -779,25 +779,13 @@ void BoundedSigmoidNode::boundBackward( const BoundA &last_lA, const BoundA &las
 
     // Spec dim from A matrix for per-spec alpha
     int specDim = 1;
-    auto inferSpecDim = []( const BoundA &A ) -> int
-    {
-        if ( !A.defined() || !A.isTensor() )
-            return 1;
-        torch::Tensor t = A.asTensor();
-        if ( !t.defined() )
-            return 1;
-        // A matrix: spec dim is always first dimension
-        if ( t.dim() >= 2 )
-            return (int)t.size( 0 );
-        return 1;
-    };
     if ( last_lA.defined() && last_lA.isTensor() )
     {
-        specDim = inferSpecDim( last_lA );
+        specDim = last_lA.inferSpecDim();
     }
     else if ( last_uA.defined() && last_uA.isTensor() )
     {
-        specDim = inferSpecDim( last_uA );
+        specDim = last_uA.inferSpecDim();
     }
     _currentSpecDim = specDim;
 

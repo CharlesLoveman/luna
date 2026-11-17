@@ -70,6 +70,37 @@ public:
             return std::get<std::shared_ptr<Patches>>( data ) != nullptr;
         return false;
     }
+
+    int inferSpecDim() const
+    {
+        if ( !defined() )
+            return 1;
+        if ( isTensor() )
+        {
+            torch::Tensor t = asTensor();
+            if ( !t.defined() )
+                return 1;
+            if ( t.dim() >= 2 )
+                return (int)t.size( 0 );
+            return 1;
+        }
+        if ( isPatches() )
+        {
+            auto p = asPatches();
+            if ( !p )
+                return 1;
+            if ( p->unstable_idx.has_value() )
+            {
+                return (int)p->patches.size( 0 );
+            }
+            if ( p->patches.dim() == 7 )
+            {
+                return (int)( p->patches.size( 0 ) * p->patches.size( 2 ) * p->patches.size( 3 ) );
+            }
+            return (int)p->patches.size( 0 );
+        }
+        return 1;
+    }
 };
 
 } // namespace NLR
